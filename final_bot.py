@@ -195,8 +195,40 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         resp = page.inner_text("body")
     except Exception:
         resp = ""
+    # Scroll the outcome into the viewport, then capture a VIEWPORT screenshot
+    # (not the top of the page) so the result text is actually visible in the
+    # image we send — a full-page/top shot hides the result below the fold.
+    try:
+        page.evaluate("""() => {
+            const txt = (document.body.innerText || '').toLowerCase();
+            const markers = ['insufficient','declined','approved','success','access granted',
+                'thank you','error','missing','required','confirm','processing','order',
+                'receipt','could not'];
+            let found = null;
+            for (const m of markers) { if (txt.indexOf(m) >= 0) { found = m; break; } }
+            if (found) {
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                while (walker.nextNode()) {
+                    const n = walker.currentNode;
+                    if (n.nodeValue && n.nodeValue.toLowerCase().includes(found)) {
+                        let el = n.parentElement;
+                        while (el && el.scrollIntoView && getComputedStyle(el).display === 'none') el = el.parentElement;
+                        if (el && el.scrollIntoView) { el.scrollIntoView({block:'center'}); break; }
+                    }
+                }
+            } else {
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+        }""")
+        page.wait_for_timeout(500)
+    except Exception:
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
     shot = f"{tag}_{last4}.png"
-    page.screenshot(path=shot, full_page=True)
+    page.screenshot(path=shot)
 
     low = resp.lower()
     fail_rules = [
