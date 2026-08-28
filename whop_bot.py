@@ -850,6 +850,36 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
                     "screenshot": f"{tag}_{last4}.png", "proxy": proxy["server"]}
 
         page.screenshot(path=f"{tag}_{last4}_pre.png", full_page=True)
+
+        # ENFORCE state in form right before submit — nuclear safety net
+        # Works even if React select reverts or mirrors were removed
+        def enforce_state(page, abbr):
+            page.evaluate(
+                """(abbr) => {
+                    // 1) Force any <select name="state"> to the value
+                    document.querySelectorAll('select[name="state"]').forEach(s => {
+                        const proto = HTMLSelectElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                        setter.call(s, abbr);
+                        s.dispatchEvent(new Event('input', {bubbles:true}));
+                        s.dispatchEvent(new Event('change', {bubbles:true}));
+                        s.dispatchEvent(new Event('blur', {bubbles:true}));
+                    });
+                    // 2) Ensure a hidden input exists in the form with the value
+                    const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+                    let hidden = form.querySelector('input[name="state"][type="hidden"]');
+                    if (!hidden) {
+                        hidden = document.createElement('input');
+                        hidden.type = 'hidden';
+                        hidden.name = 'state';
+                        form.appendChild(hidden);
+                    }
+                    hidden.value = abbr;
+                }""", abbr)
+
+        enforce_state(page, addr["state"])
+        page.wait_for_timeout(500)
+
         try:
             page.get_by_role("button", name="Get access").click(timeout=8000, delay=20)
         except Exception:
