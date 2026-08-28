@@ -828,25 +828,25 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
                     "response": "Source invalid: " + "; ".join(src_errors),
                     "screenshot": f"{tag}_{last4}.png", "proxy": proxy["server"]}
 
-        # 2) fill each field exactly once (clear -> set -> read-back repair)
-        # IMPORTANT ORDER: Whop only renders the `state` <select> AFTER the
-        # address line 1 (and other address fields) are filled. So we fill
-        # country/name/line1/city/zip FIRST, then wait for the state select
-        # to appear, THEN fill state. Filling state too early = silent no-op.
+        # 2) fill each field — line1 uses autocomplete to trigger browser fill
         fill_all(page, "country", "US")
         jitter(page)
         fill_all(page, "name", name)
         jitter(page)
         fill_all(page, "line1", addr["line1"])
-        jitter(page)
-        fill_all(page, "city", addr["city"])
-        jitter(page)
-        fill_all(page, "zip", addr["zip"])
-        jitter(page)
-        # state select renders + loads its options async after line1; the
-        # wait/retry now lives inside fill_field_strict (state branch)
-        fill_all(page, "state", addr["state"])
-        jitter(page)
+        page.wait_for_timeout(2000)  # wait for autocomplete to fill city/state/zip
+
+        # Read what autocomplete filled, only fill gaps
+        form = read_form(page)
+        if not _norm(form.get("city")):
+            fill_all(page, "city", addr["city"])
+            jitter(page)
+        if not _norm(form.get("zip")):
+            fill_all(page, "zip", addr["zip"])
+            jitter(page)
+        if not _norm(form.get("state")):
+            fill_all(page, "state", addr["state"])
+            jitter(page)
         fill_all(page, "email", email)
         jitter(page)
         fill_card(page, cc)
