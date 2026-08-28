@@ -841,11 +841,15 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
             jitter(page)
         if not _norm(form.get("state")):
             fill_all(page, "state", addr["state"])
+            enforce_state(page, addr["state"])
             jitter(page)
         fill_all(page, "email", email)
         jitter(page)
         fill_card(page, cc)
         jitter(page)
+
+        # Enforce state again after card fill (React may have re-rendered)
+        enforce_state(page, addr["state"])
 
         # 3) CORRECTIVE loop: Whop's state field can mount late / re-render,
         #     leaving the read-back empty even though a value was set. Retry
@@ -860,6 +864,7 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
             print(f"[{tag}] retry {attempt}: {form_errors}", flush=True)
             if not _norm(form.get("state")):
                 fill_all(page, "state", addr["state"])
+                enforce_state(page, addr["state"])
                 page.wait_for_timeout(1500)
             if not _norm(form.get("line1")):
                 fill_all(page, "line1", addr["line1"])
