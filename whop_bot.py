@@ -622,11 +622,21 @@ def read_form(page):
             return _norm(page.locator(sel).first.input_value(timeout=timeout))
         except Exception:
             return ""
+    def read_state():
+        # Whop renders a hidden mirror input (name="state") AND a visible
+        # <select name="state">. The mirror often stays "" even when the
+        # select holds the real value, so prefer the SELECT (or whichever
+        # element actually carries a non-empty value) to avoid false "missing".
+        for sel in ("select[name='state']", "input[name='state']"):
+            v = getval(sel)
+            if v:
+                return v
+        return ""
     return {
         "name":  getval('input[name="name"]'),
         "line1": getval('input[name="line1"]'),
         "city":  getval('input[name="city"]'),
-        "state": getval('input[name="state"]') or getval('select[name="state"]'),
+        "state": read_state(),
         "zip":   getval('input[name="zip"]'),
         "country": getval('select[name="country"]'),
         "email": getval('input[name="email"]'),
@@ -785,12 +795,43 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         fill_card(page, cc)
         jitter(page)
 
-        # 3) FINAL validation of the LIVE page — do NOT submit if it fails
-        form = read_form(page)
-        form_errors = validate_form(form)
+        # 3) CORRECTIVE loop: Whop's state field can mount late / re-render,
+        #     leaving the read-back empty even though a value was set. Retry
+        #     the fill a few times and re-read before giving up.
+        form = {}
+        form_errors = ["force"]
+        for attempt in range(4):
+            form = read_form(page)
+            form_errors = validate_form(form)
+            if not form_errors:
+                break
+            print(f"[{tag}] retry {attempt}: {form_errors}", flush=True)
+            if not _norm(form.get("state")):
+                fill_all(page, "state", addr["state"])
+                page.wait_for_timeout(1500)
+            if not _norm(form.get("line1")):
+                fill_all(page, "line1", addr["line1"])
+            if not _norm(form.get("city")):
+                fill_all(page, "city", addr["city"])
+            if not _norm(form.get("zip")):
+                fill_all(page, "zip", addr["zip"])
+            if not _norm(form.get("name")):
+                fill_all(page, "name", name)
+            page.wait_for_timeout(800)
         print(f"[{tag}] VALIDATION FORM = {form}", flush=True)
         if form_errors:
-            print(f"[{tag}] VALIDATION FAILED: {form_errors}", flush=True)
+            diag = page.evaluate("""() => {
+                const out = {};
+                const sels = document.querySelectorAll('select[name="state"]');
+                out.nSelect = sels.length;
+                out.selVal = sels.length ? sels[0].value : '(none)';
+                out.nOpts = sels.length ? sels[0].options.length : 0;
+                const ms = document.querySelectorAll('input[name="state"]');
+                out.nMirror = ms.length;
+                out.mirrorVals = [...ms].map(m => m.value);
+                return out;
+            }""")
+            print(f"[{tag}] STATE DIAG = {diag}", flush=True)
             page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
             browser.close()
             return {"cc": cc["number"], "last4": last4, "status": "missing",
