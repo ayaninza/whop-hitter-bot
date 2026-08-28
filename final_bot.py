@@ -376,6 +376,7 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
             print(f"[{tag}] billing block slow; continuing (corrective loop will fill)", flush=True)
 
         result = fill_and_submit(page, addr, email, cc, tag, submit)
+        result["proxy"] = (proxy or {}).get("server")
         browser.close()
         return result
 

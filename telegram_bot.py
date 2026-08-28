@@ -250,15 +250,16 @@ def record_result(cc, res):
     db = get_db()
     for c in db["ccs"]:
         if c.get("raw") == cc.get("raw"):
-            c["status"] = res["status"]
-            c["response"] = res["response"][:500]
-            c["proxy"] = res["proxy"]
+            c["status"] = res.get("status", "")
+            c["response"] = (res.get("response") or "")[:500]
+            c["proxy"] = res.get("proxy", "")
             c["ts"] = time.time()
-            c["live"] = (res["status"] == "success")
+            c["live"] = (res.get("status") == "success")
             break
     db["last_run"].append({
-        "raw": cc.get("raw"), "status": res["status"],
-        "proxy": res["proxy"], "response": res["response"][:300],
+        "raw": cc.get("raw"), "status": res.get("status", ""),
+        "proxy": res.get("proxy", ""),
+        "response": (res.get("response") or "")[:300],
     })
     save_db()
 
