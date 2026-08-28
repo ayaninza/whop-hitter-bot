@@ -364,7 +364,7 @@ FIELD_SELECTORS = {
     "line1":   ['input[name="line1"]'],
     "line2":   ['input[name="line2"]'],
     "city":    ['input[name="city"]'],
-    "state":   ['input[name="state"]', 'select[name="state"]'],
+    "state":   ['select[name="state"]', 'input[name="state"]'],
     "zip":     ['input[name="zip"]'],
     "country": ['select[name="country"]'],
     "email":   ['input[name="email"]'],
@@ -493,9 +493,13 @@ def fill_field_strict(page, key, value):
             try:
                 tag = el.element_handle().evaluate("n => n.tagName.toLowerCase()")
                 if key == "state" and tag == "select":
-                    # options use value="NY", label="New York"
+                    # The option list loads async; wait for the matching
+                    # option to exist, else select_option fails silently.
+                    _wait_state_option(page, st_abbr, st_full, timeout=30000)
+                    attempts = [("value", st_abbr), ("label", st_full),
+                                ("value", st_full), ("label", st_abbr)]
                     ok = False
-                    for kw, v in (("value", st_abbr), ("label", st_full)):
+                    for kw, v in attempts:
                         try:
                             el.select_option(**{kw: v}, timeout=3000)
                             ok = True
@@ -507,6 +511,23 @@ def fill_field_strict(page, key, value):
                             el.evaluate(JS_SET, st_abbr)
                         except Exception:
                             pass
+                    # verify; retry once after a short pause if it didn't stick
+                    try:
+                        cur = el.input_value()
+                    except Exception:
+                        cur = ""
+                    if _norm(cur) != _norm(st_abbr):
+                        page.wait_for_timeout(800)
+                        for kw, v in attempts:
+                            try:
+                                el.select_option(**{kw: v}, timeout=3000)
+                                break
+                            except Exception:
+                                continue
+                        try:
+                            cur = el.input_value()
+                        except Exception:
+                            cur = ""
                     target = st_abbr
                 elif tag == "select":
                     ok = False
@@ -548,19 +569,29 @@ def fill_field_strict(page, key, value):
     return done
 
 
-def wait_for_state_select(page, timeout=10000):
-    """Whop's state <select> only appears once address line 1 is filled.
-    Poll for it so we never try to fill state before it exists."""
-    step = 400
+def _wait_state_option(page, abbr, full, timeout=30000):
+    """Whop's state <select> appears AFTER address line 1, and its <option>
+    list is loaded ASYNCHRONOUSLY (often slower through a proxy). If we call
+    select_option before the options exist, it silently fails and the value
+    reverts to ''. So poll until the matching option is actually present."""
+    step = 500
     waited = 0
     while waited < timeout:
         try:
-            if page.locator('select[name="state"]').count() > 0:
-                return True
+            sel = page.locator('select[name="state"]')
+            if sel.count() > 0:
+                opts = sel.first.evaluate(
+                    "s => [...s.options].map(o => ({v: o.value, t: o.text}))")
+                for o in opts:
+                    if o["v"] == abbr or o["v"] == full or \
+                       o["t"] == full or o["t"] == abbr:
+                        return True
         except Exception:
             pass
         page.wait_for_timeout(step)
         waited += step
+    print(f"[state] option for {abbr}/{full} not found within {timeout}ms",
+          flush=True)
     return False
 
 
@@ -727,7 +758,8 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         jitter(page)
         fill_all(page, "zip", addr["zip"])
         jitter(page)
-        wait_for_state_select(page, timeout=10000)
+        # state select renders + loads its options async after line1; the
+        # wait/retry now lives inside fill_field_strict (state branch)
         fill_all(page, "state", addr["state"])
         jitter(page)
         fill_all(page, "email", email)
