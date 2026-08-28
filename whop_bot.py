@@ -533,38 +533,38 @@ def fill_field_strict(page, key, value):
             try:
                 tag = el.element_handle().evaluate("n => n.tagName.toLowerCase()")
                 if key == "state" and tag == "select":
-                    # CRITICAL: select_option and raw setters DO NOT WORK on Whop's
-                    # React-controlled <select> (value reverts to '' on re-render).
-                    # The ONLY reliable way is REAL keyboard interaction: click,
-                    # type abbreviation, press Enter — triggers React's onChange.
+                    # CRITICAL: select_option/click/keyboard are unreliable on Whop's
+                    # React-controlled <select> (intercepted clicks, value reverts).
+                    # Use RAW prototype setter + hidden input injection + FormData verify.
                     _wait_state_option(page, st_abbr, st_full, timeout=30000)
                     ok = False
                     for attempt in range(3):
                         try:
-                            el.wait_for(state="visible", timeout=5000)
-                            el.click(timeout=3000)
-                            page.wait_for_timeout(300)
-                            page.keyboard.type(st_abbr, delay=100)
-                            page.wait_for_timeout(300)
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(500)
-                            # Verify via FormData (what actually submits)
-                            cur = page.evaluate(
-                                """() => {
-                                    const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                                    return new FormData(f).get('state') || '';
-                                }""")
-                            if _norm(cur) == _norm(st_abbr):
-                                ok = True
-                                break
-                            page.wait_for_timeout(300)
-                        except Exception as e:
-                            print(f"[state] keyboard attempt {attempt+1} failed: {e}", flush=True)
-                            page.wait_for_timeout(300)
-                    if not ok:
-                        # Last resort: raw setter + hidden input injection
-                        try:
-                            el.evaluate(JS_SET, st_abbr)
+                            # 1) Raw setter + full React event suite on the select
+                            el.evaluate(
+                                """(node, abbr, full) => {
+                                    // Ensure option exists
+                                    let found = false;
+                                    for (const opt of node.options) {
+                                        if (opt.value === abbr || opt.text === full) {
+                                            found = true; break;
+                                        }
+                                    }
+                                    if (!found) {
+                                        const o = document.createElement('option');
+                                        o.value = abbr; o.textContent = full;
+                                        node.appendChild(o);
+                                    }
+                                    // Raw value setter + React event suite
+                                    const proto = HTMLSelectElement.prototype;
+                                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                                    setter.call(node, abbr);
+                                    node.dispatchEvent(new Event('input', {bubbles:true}));
+                                    node.dispatchEvent(new Event('change', {bubbles:true}));
+                                    node.dispatchEvent(new Event('blur', {bubbles:true}));
+                                }""", st_abbr, st_full)
+                            page.wait_for_timeout(200)
+                            # 2) Ensure hidden input exists in form (what server reads)
                             page.evaluate(
                                 """(abbr) => {
                                     const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
@@ -577,7 +577,8 @@ def fill_field_strict(page, key, value):
                                     }
                                     hidden.value = abbr;
                                 }""", st_abbr)
-                            page.wait_for_timeout(300)
+                            page.wait_for_timeout(200)
+                            # Verify via FormData (what actually submits)
                             cur = page.evaluate(
                                 """() => {
                                     const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
@@ -585,6 +586,8 @@ def fill_field_strict(page, key, value):
                                 }""")
                             if _norm(cur) == _norm(st_abbr):
                                 ok = True
+                                break
+                            page.wait_for_timeout(300)
                         except Exception:
                             pass
                     target = st_abbr
