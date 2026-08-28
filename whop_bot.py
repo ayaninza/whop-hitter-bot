@@ -919,15 +919,52 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         except Exception:
             pass
 
-        page.wait_for_timeout(4000)
-        try:
-            page.wait_for_function(
-                "() => { const b=document.querySelector('button[type=submit]'); "
-                "return b && !/process|loading|.../i.test(b.innerText); }",
-                timeout=10000)
-        except Exception:
-            pass
-        print(f"[{tag}] submitted, reading result", flush=True)
+        # --- Wait for the submission to ACTUALLY finish before reading the
+        # result or taking the screenshot. Previously the bot waited a fixed
+        # 4s and read the body while Whop was still "Processing...", so the
+        # body had no success/decline keyword yet -> "Unclear result". Now we
+        # poll until the in-flight spinner / disabled submit button is gone
+        # (and/or a concrete result signal appears) before reading. ---
+        INFLIGHT_JS = """() => {
+            const body = (document.body && document.body.innerText || '').toLowerCase();
+            if (/processing|please wait|submitting|loading|\\.\\.\\./i.test(body)) return true;
+            for (const b of document.querySelectorAll('button, [role=button]')) {
+                const t = (b.innerText || '').toLowerCase();
+                if (/processing|please wait|submitting|loading|\\.\\.\\./i.test(t)) return true;
+                if (b.disabled && /submit|pay|access|confirm|process/i.test(t)) return true;
+            }
+            const sb = document.querySelector('button[type=submit]');
+            if (sb && sb.disabled) return true;
+            return false;
+        }"""
+        RESULT_JS = """() => {
+            const body = (document.body && document.body.innerText || '').toLowerCase();
+            const sig = ['payment successful','you now have access','access granted','order confirmed',
+                'purchase complete','thank you for your payment','subscription is active','your subscription',
+                'welcome to','insufficient','declined',"couldn't be processed",'could not be processed',
+                'try a different','do not honor','expired','invalid address','enter a valid address',
+                'invalid zip','missing field','required field','this field is required','verify',
+                'payment could not','card could not','error'];
+            for (const s of sig) if (body.includes(s)) return true;
+            if (/confirm|success|access|thank/i.test(location.href)) return true;
+            return false;
+        }"""
+        seen_loading = False
+        for _ in range(50):  # up to ~75s
+            try:
+                if page.evaluate(RESULT_JS):
+                    break
+                in_flight = page.evaluate(INFLIGHT_JS)
+                if in_flight:
+                    seen_loading = True
+                elif seen_loading:
+                    # loading stopped after we observed it -> result should render now
+                    page.wait_for_timeout(1500)
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+        print(f"[{tag}] settled, reading result", flush=True)
 
         try:
             resp = page.inner_text("body")
