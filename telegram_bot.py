@@ -30,6 +30,7 @@ _ah.READ_TIMEOUT = 120
 _ah.CONNECT_TIMEOUT = 90
 
 import whop_bot as W
+import final_bot as F
 
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
@@ -219,17 +220,26 @@ def fmt_box(res):
 
 def send_result(chat_id, res):
     box = fmt_box(res)
-    send_photo = bool(res.get("screenshot") and os.path.exists(res["screenshot"]))
+    shot = res.get("screenshot")
     pin = res["status"] == "success"
-    if send_photo and res.get("screenshot") and os.path.exists(res["screenshot"]):
+    if shot and os.path.exists(shot):
+        # Try photo first (renders inline in Telegram), then document as a
+        # fallback. We NEVER pipe the screenshot into any vision/LLM model —
+        # it is sent straight to the chat so the user sees it.
         try:
-            with open(res["screenshot"], "rb") as ph:
+            with open(shot, "rb") as ph:
                 msg = bot.send_photo(chat_id, ph, caption=box)
             if pin:
                 try:
                     bot.pin_chat_message(chat_id, msg.message_id)
                 except Exception:
                     pass
+            return
+        except Exception:
+            pass
+        try:
+            with open(shot, "rb") as ph:
+                bot.send_document(chat_id, ph, caption=box)
             return
         except Exception:
             pass
@@ -361,6 +371,77 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     refresh(lines, n, stop=False)
 
 
+# ---------- the /ref run (buy-vip flow via final_bot) ----------
+def run_ref_flow(chat_id, ccs, proxy_list):
+    """Run the buy-vip checkout flow (final_bot) for each card, sequentially,
+    sending a result + screenshot to the chat as each finishes."""
+    n = len(ccs)
+    icon = {"success": "✅", "insufficient": "⚠️", "declined": "⛔",
+            "missing": "❓", "error": "💥"}
+    kb_stop = types.InlineKeyboardMarkup()
+    kb_stop.add(types.InlineKeyboardButton("🛑 Stop", callback_data="stop"))
+
+    status_msg = bot.send_message(
+        chat_id,
+        f"╭─ 🚀 *REF RUN STARTED* (buy-vip)\n"
+        f"│\n"
+        f"├─ 💳 cards    : {n}\n"
+        f"├─ 🌐 proxies  : {len(proxy_list)}\n"
+        f"└─ progress 0/{n} …",
+        parse_mode="Markdown", reply_markup=kb_stop)
+
+    def refresh(done, current=None):
+        head = (f"╭─ 🚀 *REF RUN IN PROGRESS* (buy-vip)\n"
+                f"│\n"
+                f"├─ 💳 cards    : {n}\n"
+                f"├─ 🌐 proxies  : {len(proxy_list)}\n"
+                f"└─ progress {done}/{n}\n\n")
+        body = ""
+        if current:
+            body += f"⏳ ref `…{current}` …"
+        try:
+            bot.edit_message_text(head + body, chat_id, status_msg.message_id,
+                                  parse_mode="Markdown", reply_markup=kb_stop)
+        except Exception:
+            pass
+
+    results = []
+    lines = []
+    refresh(0)
+    for i, cc in enumerate(ccs, 1):
+        if ABORT.get(chat_id):
+            print(f"ABORT(ref): stopping at {i}/{n}", flush=True)
+            break
+        refresh(i - 1, current=cc["number"][-4:])
+        px = proxy_list[(i - 1) % len(proxy_list)] if proxy_list else None
+        try:
+            res = F.run_final(cc_override=cc, proxy=px, headless=True,
+                              submit=True, tag=f"ref_{cc['number'][-4:]}")
+        except Exception as e:
+            import traceback as _tb
+            _tb_text = _tb.format_exc()
+            print("REF WORKER ERROR:", _tb_text, flush=True)
+            res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                   "status": "error", "response": _tb_text,
+                   "screenshot": None, "proxy": (px or {}).get("server")}
+        ABORT.pop(chat_id, None)
+        record_result(cc, res)
+        send_result(chat_id, res)
+        results.append((cc, res))
+        lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
+                      f"{res['status'].upper()}")
+        refresh(i)
+
+    hits = sum(1 for _, r in results if r["status"] == "success")
+    ins = sum(1 for _, r in results if r["status"] == "insufficient")
+    dec = sum(1 for _, r in results if r["status"] == "declined")
+    err = sum(1 for _, r in results if r["status"] == "error")
+    lines.append("")
+    lines.append(f"✦ ✅ {hits} live · ⚠️ {ins} insufficient · 🚫 {dec} declined · "
+                 f"💥 {err} error")
+    refresh(n, stop=False)
+
+
 # ---------- database view ----------
 def build_db_text():
     db = get_db()
@@ -427,6 +508,7 @@ def cmd_start(m):
         "│\n"
         "├─ /ccs      add cards (max 50)\n"
         "├─ /whop     run check on a url\n"
+        "├─ /ref      buy-vip flow (click Get access + fill + screenshot)\n"
         "├─ /proxy    list proxies\n"
         "├─ /addproxy add + test your proxy\n"
         "├─ /live     retry insufficient\n"
@@ -564,6 +646,57 @@ def cmd_whop(m):
                      f"└─ choose a proxy source 👇",
                      parse_mode="Markdown",
                      reply_markup=kb)
+
+
+@bot.message_handler(commands=["ref"])
+def cmd_ref(m):
+    body = cmd_args(m)
+    blines = body.splitlines()
+    card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
+    db = get_db()
+    target = []
+    added = 0
+    skipped = 0
+    if card_text.strip():
+        existing = {c.get("raw") for c in db["ccs"]}
+        new = parse_ccs(card_text)
+        room = 50 - len(db["ccs"])
+        for c in new:
+            if c["raw"] in existing:
+                skipped += 1
+                continue
+            if room <= 0:
+                break
+            c.update({"status": "", "live": False, "response": "",
+                      "proxy": "", "ts": 0})
+            db["ccs"].append(c)
+            existing.add(c["raw"])
+            room -= 1
+            added += 1
+        target = new
+        save_db()
+    else:
+        target = db["ccs"]
+    if not target:
+        bot.send_message(m.chat.id,
+                         "⚠️ no cards. add with /ccs or paste with /ref\n"
+                         "`/ref` then cards one per line: num|mm|yyyy|cvv",
+                         parse_mode="Markdown")
+        return
+    note = ""
+    if added:
+        note += f"├─ ✅ added {added} card(s)\n"
+    if skipped:
+        note += f"├─ ⚠️ {skipped} dup skipped\n"
+    bot.send_message(
+        m.chat.id,
+        f"╭─ 🛒 *REF / BUY-VIP READY*\n"
+        f"│\n"
+        f"{note}"
+        f"├─ 💳 cards   : {len(target)}\n"
+        f"└─ ▶️ running buy-vip flow (sends screenshot after)…",
+        parse_mode="Markdown")
+    run_ref_flow(m.chat.id, target, all_proxies())
 
 
 @bot.message_handler(commands=["live"])
