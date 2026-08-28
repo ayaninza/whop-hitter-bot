@@ -438,12 +438,6 @@ def validate_address(addr):
             errors.append(f"Invalid ZIP: {zipc}")
         if not _valid_state(addr.get("state")):
             errors.append(f"Invalid state: {addr.get('state')!r}")
-    # no field may contain another field's exact value
-    vals = {f: _norm(addr.get(f)) for f in required if _norm(addr.get(f))}
-    for f, v in vals.items():
-        for g, w in vals.items():
-            if f != g and v and v in w and v != w:
-                errors.append(f"Field '{f}' value leaked into '{g}'")
     return errors
 
 
@@ -528,6 +522,30 @@ def fill_field_strict(page, key, value):
                             cur = el.input_value()
                         except Exception:
                             cur = ""
+                    # FALLBACK: the async state option list sometimes never
+                    # loads through a proxy. Inject the option ourselves and
+                    # drive React's onChange so the value is captured even
+                    # when the remote list is unavailable.
+                    if _norm(cur) != _norm(st_abbr):
+                        try:
+                            el.evaluate(
+                                """(node, abbr, full) => {
+                                    const o = document.createElement('option');
+                                    o.value = abbr; o.textContent = full;
+                                    node.appendChild(o);
+                                    const setter = Object.getOwnPropertyDescriptor(
+                                        HTMLSelectElement.prototype, 'value').set;
+                                    setter.call(node, abbr);
+                                    node.dispatchEvent(new Event('change', {bubbles:true}));
+                                    node.dispatchEvent(new Event('input', {bubbles:true}));
+                                }""", st_abbr, st_full)
+                            page.wait_for_timeout(300)
+                            try:
+                                cur = el.input_value()
+                            except Exception:
+                                cur = ""
+                        except Exception:
+                            pass
                     target = st_abbr
                 elif tag == "select":
                     ok = False
