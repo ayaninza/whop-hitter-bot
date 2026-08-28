@@ -272,6 +272,9 @@ FIELD_SELECTORS = {
 def fill_all(page, key, value):
     if value in ("", None):
         return 0
+    # Special handling for line1: type char-by-char to trigger browser autocomplete
+    if key == "line1":
+        return fill_line1_autocomplete(page, value)
     done = 0
     for sel in FIELD_SELECTORS[key]:
         for el in page.locator(sel).all():
@@ -296,6 +299,49 @@ def fill_all(page, key, value):
                 continue
     print(f"[{'ok' if done else 'skip'}] {key} -> {done}")
     return done
+
+
+def fill_line1_autocomplete(page, address):
+    """Type line1 char-by-char to trigger browser autocomplete, then pick suggestion.
+    This fills city/state/zip automatically like a real user."""
+    value = _norm(address)
+    if not value:
+        return 0
+    try:
+        # Find the line1 input (first visible)
+        el = page.locator('input[name="line1"]').first
+        el.click(timeout=3000)
+        page.wait_for_timeout(200)
+        # Clear any existing value
+        el.press("Control+A")
+        el.press("Delete")
+        page.wait_for_timeout(150)
+        # Type char-by-char with human delays
+        for ch in address:
+            el.type(ch, delay=random.randint(80, 180))
+        page.wait_for_timeout(1200)  # wait for autocomplete dropdown
+        # Try to pick first suggestion
+        try:
+            # Common autocomplete selectors
+            page.keyboard.press("ArrowDown")
+            page.wait_for_timeout(150)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+        print("[ok] line1 (autocomplete) -> 1", flush=True)
+        return 1
+    except Exception as e:
+        print(f"[skip] line1 autocomplete: {e}, falling back to fill", flush=True)
+        # Fallback to regular fill
+        for sel in FIELD_SELECTORS.get("line1", []):
+            for el in page.locator(sel).all():
+                try:
+                    el.fill(address, timeout=1500)
+                    return 1
+                except Exception:
+                    pass
+        return 0
 
 
 def frame_by_keyword(page, kw):
