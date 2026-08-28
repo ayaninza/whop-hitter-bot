@@ -487,63 +487,66 @@ def fill_field_strict(page, key, value):
             try:
                 tag = el.element_handle().evaluate("n => n.tagName.toLowerCase()")
                 if key == "state" and tag == "select":
-                    # The option list loads async; wait for the matching
-                    # option to exist, else select_option fails silently.
+                    # CRITICAL: select_option does NOT work on Whop's React-controlled
+                    # <select> (it reverts to '' on re-render). Use the raw prototype
+                    # setter + full event suite directly, then verify via FormData.
                     _wait_state_option(page, st_abbr, st_full, timeout=30000)
-                    attempts = [("value", st_abbr), ("label", st_full),
-                                ("value", st_full), ("label", st_abbr)]
                     ok = False
-                    for kw, v in attempts:
-                        try:
-                            el.select_option(**{kw: v}, timeout=3000)
-                            ok = True
-                            break
-                        except Exception:
-                            continue
-                    if not ok:
-                        try:
-                            el.evaluate(JS_SET, st_abbr)
-                        except Exception:
-                            pass
-                    # verify; retry once after a short pause if it didn't stick
-                    try:
-                        cur = el.input_value()
-                    except Exception:
-                        cur = ""
-                    if _norm(cur) != _norm(st_abbr):
-                        page.wait_for_timeout(800)
-                        for kw, v in attempts:
-                            try:
-                                el.select_option(**{kw: v}, timeout=3000)
-                                break
-                            except Exception:
-                                continue
-                        try:
-                            cur = el.input_value()
-                        except Exception:
-                            cur = ""
-                    # FALLBACK: the async state option list sometimes never
-                    # loads through a proxy. Inject the option ourselves and
-                    # drive React's onChange so the value is captured even
-                    # when the remote list is unavailable.
-                    if _norm(cur) != _norm(st_abbr):
+                    for attempt in range(3):
                         try:
                             el.evaluate(
                                 """(node, abbr, full) => {
-                                    const o = document.createElement('option');
-                                    o.value = abbr; o.textContent = full;
-                                    node.appendChild(o);
-                                    const setter = Object.getOwnPropertyDescriptor(
-                                        HTMLSelectElement.prototype, 'value').set;
+                                    // Ensure the option exists in the DOM
+                                    let found = false;
+                                    for (const opt of node.options) {
+                                        if (opt.value === abbr || opt.text === full) {
+                                            found = true; break;
+                                        }
+                                    }
+                                    if (!found) {
+                                        const o = document.createElement('option');
+                                        o.value = abbr; o.textContent = full;
+                                        node.appendChild(o);
+                                    }
+                                    // Raw value setter + full React event suite
+                                    const proto = HTMLSelectElement.prototype;
+                                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
                                     setter.call(node, abbr);
-                                    node.dispatchEvent(new Event('change', {bubbles:true}));
                                     node.dispatchEvent(new Event('input', {bubbles:true}));
+                                    node.dispatchEvent(new Event('change', {bubbles:true}));
+                                    node.dispatchEvent(new Event('blur', {bubbles:true}));
                                 }""", st_abbr, st_full)
+                            page.wait_for_timeout(200)
+                            # Verify via FormData (what actually submits)
+                            cur = page.evaluate(
+                                """() => {
+                                    const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+                                    const fd = new FormData(f);
+                                    return fd.get('state') || '';
+                                }""")
+                            if _norm(cur) == _norm(st_abbr):
+                                ok = True
+                                break
                             page.wait_for_timeout(300)
-                            try:
-                                cur = el.input_value()
-                            except Exception:
-                                cur = ""
+                        except Exception:
+                            pass
+                    # Last resort: click the select and arrow down to the option
+                    if not ok:
+                        try:
+                            el.click(timeout=2000)
+                            page.keyboard.press("ArrowDown")
+                            for _ in range(5):
+                                page.keyboard.press("ArrowDown")
+                                page.wait_for_timeout(50)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(200)
+                            cur = page.evaluate(
+                                """() => {
+                                    const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+                                    return new FormData(f).get('state') || '';
+                                }""")
+                            if _norm(cur) == _norm(st_abbr):
+                                ok = True
                         except Exception:
                             pass
                     target = st_abbr
@@ -623,10 +626,18 @@ def read_form(page):
         except Exception:
             return ""
     def read_state():
-        # Whop renders a hidden mirror input (name="state") AND a visible
-        # <select name="state">. The mirror often stays "" even when the
-        # select holds the real value, so prefer the SELECT (or whichever
-        # element actually carries a non-empty value) to avoid false "missing".
+        # 1) Try FormData first — this is exactly what the server receives
+        try:
+            fd_val = page.evaluate(
+                """() => {
+                    const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+                    return new FormData(f).get('state') || '';
+                }""")
+            if _norm(fd_val):
+                return _norm(fd_val)
+        except Exception:
+            pass
+        # 2) Fallback: prefer the <select> (mirror often stays empty on Railway)
         for sel in ("select[name='state']", "input[name='state']"):
             v = getval(sel)
             if v:
