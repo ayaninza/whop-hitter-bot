@@ -442,6 +442,29 @@ US_STATE_FULL_LOWER = {v.lower() for v in US_STATE_FULL.values()}
 US_STATE_ABBR = {v: k for k, v in US_STATE_FULL.items()}
 
 
+def _resolve_state(value):
+    """Resolve a state input (abbr OR full name, any case) to
+    (abbr, full_name). Whop's <select> option VALUES are the 2-letter
+    codes, so we must always select by abbr. The previous code did
+    `value.upper()` and looked it up in US_STATE_ABBR whose keys are
+    title-case ("Washington"); a full-name input became "WASHINGTON",
+    matched nothing, and st_abbr was left as the literal "WASHINGTON" —
+    which matches no <option>, so the visible field stayed empty and the
+    form reported "Missing fields". Returns (value, value) if unresolvable
+    (left as-is so the caller can still attempt it)."""
+    v = _norm(value)
+    if not v:
+        return None, None
+    vup = v.upper()
+    if vup in US_STATE_FULL:                 # input was an abbreviation
+        return vup, US_STATE_FULL[vup]
+    by_name = {name.upper(): abbr for abbr, name in US_STATE_FULL.items()}
+    if vup in by_name:                        # input was a full name (any case)
+        abbr = by_name[vup]
+        return abbr, US_STATE_FULL[abbr]
+    return v, v
+
+
 def _valid_state(st):
     st = _norm(st).upper()
     if not st:
@@ -512,16 +535,15 @@ def fill_field_strict(page, key, value):
     value = _norm(value)
     if value in ("", None):
         return 0
-    # Pre-compute state abbrev/full for the conditional <select name="state">
+    # Pre-compute state abbrev/full for the conditional <select name="state">.
+    # Whop's option VALUES are 2-letter codes ("WA"); labels are full names.
+    # The source address uses FULL names (e.g. "Washington"), so resolve
+    # case-insensitively; the old value.upper() lookup failed because
+    # US_STATE_ABBR keys are title-case, leaving st_abbr="WASHINGTON" which
+    # matched no <option> and left the visible field empty ("Missing fields").
     st_abbr = st_full = None
     if key == "state":
-        v = value.strip().upper()
-        if v in US_STATE_FULL:
-            st_abbr, st_full = v, US_STATE_FULL[v]
-        elif v in US_STATE_ABBR:
-            st_abbr, st_full = US_STATE_ABBR[v], v
-        else:
-            st_abbr = st_full = value
+        st_abbr, st_full = _resolve_state(value)
     sels = FIELD_SELECTORS.get(key, [])
     done = 0
     for sel in sels:
@@ -533,63 +555,29 @@ def fill_field_strict(page, key, value):
             try:
                 tag = el.element_handle().evaluate("n => n.tagName.toLowerCase()")
                 if key == "state" and tag == "select":
-                    # CRITICAL: select_option/click/keyboard are unreliable on Whop's
-                    # React-controlled <select> (intercepted clicks, value reverts).
-                    # Use RAW prototype setter + hidden input injection + FormData verify.
+                    # Whop renders the state field as a NATIVE <select name="state">
+                    # (two duplicate blocks in the billing form). Option VALUES are
+                    # 2-letter codes ("WA"); labels full names. The previous code set
+                    # the value via a prototype setter AND injected a hidden
+                    # <input name="state"> — a broken duplicate that could shadow the
+                    # real selection in FormData. We now use Playwright's
+                    # select_option (fires React's onChange reliably) against the real
+                    # <option>, with a pre-wait guaranteeing the target option exists.
                     _wait_state_option(page, st_abbr, st_full, timeout=30000)
                     ok = False
-                    for attempt in range(3):
+                    for attempt in range(4):
                         try:
-                            # 1) Raw setter + full React event suite on the select
-                            el.evaluate(
-                                """(node, abbr, full) => {
-                                    // Ensure option exists
-                                    let found = false;
-                                    for (const opt of node.options) {
-                                        if (opt.value === abbr || opt.text === full) {
-                                            found = true; break;
-                                        }
-                                    }
-                                    if (!found) {
-                                        const o = document.createElement('option');
-                                        o.value = abbr; o.textContent = full;
-                                        node.appendChild(o);
-                                    }
-                                    // Raw value setter + React event suite
-                                    const proto = HTMLSelectElement.prototype;
-                                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                                    setter.call(node, abbr);
-                                    node.dispatchEvent(new Event('input', {bubbles:true}));
-                                    node.dispatchEvent(new Event('change', {bubbles:true}));
-                                    node.dispatchEvent(new Event('blur', {bubbles:true}));
-                                }""", st_abbr, st_full)
-                            page.wait_for_timeout(200)
-                            # 2) Ensure hidden input exists in form (what server reads)
-                            page.evaluate(
-                                """(abbr) => {
-                                    const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                                    let hidden = form.querySelector('input[name="state"][type="hidden"]');
-                                    if (!hidden) {
-                                        hidden = document.createElement('input');
-                                        hidden.type = 'hidden';
-                                        hidden.name = 'state';
-                                        form.appendChild(hidden);
-                                    }
-                                    hidden.value = abbr;
-                                }""", st_abbr)
-                            page.wait_for_timeout(200)
-                            # Verify via FormData (what actually submits)
-                            cur = page.evaluate(
-                                """() => {
-                                    const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                                    return new FormData(f).get('state') || '';
-                                }""")
-                            if _norm(cur) == _norm(st_abbr):
-                                ok = True
-                                break
-                            page.wait_for_timeout(300)
+                            el.select_option(value=st_abbr, timeout=3000)
                         except Exception:
-                            pass
+                            try:
+                                el.select_option(label=st_full, timeout=3000)
+                            except Exception:
+                                pass
+                        cur = _norm(el.input_value())
+                        if cur == _norm(st_abbr) or cur == _norm(st_full):
+                            ok = True
+                            break
+                        page.wait_for_timeout(400)
                     target = st_abbr
                 elif tag == "select":
                     ok = False
@@ -667,22 +655,29 @@ def read_form(page):
         except Exception:
             return ""
     def read_state():
-        # 1) Try FormData first — this is exactly what the server receives
+        # Read the REAL <select name="state"> value(s); prefer a non-empty
+        # one. (We no longer inject a hidden input, so FormData only contains
+        # the genuine selects.) Fall back to FormData / any input last.
+        for sel in ("select[name='state']", "input[name='state']"):
+            try:
+                for el in page.locator(sel).all():
+                    v = _norm(el.input_value())
+                    if v:
+                        return v
+            except Exception:
+                pass
         try:
             fd_val = page.evaluate(
                 """() => {
                     const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                    return new FormData(f).get('state') || '';
+                    const fd = new FormData(f);
+                    for (const v of fd.getAll('state')) { if (v) return v; }
+                    return '';
                 }""")
             if _norm(fd_val):
                 return _norm(fd_val)
         except Exception:
             pass
-        # 2) Fallback: prefer the <select> (mirror often stays empty on Railway)
-        for sel in ("select[name='state']", "input[name='state']"):
-            v = getval(sel)
-            if v:
-                return v
         return ""
     return {
         "name":  getval('input[name="name"]'),
@@ -748,31 +743,22 @@ def jitter(page):
     page.wait_for_timeout(int(human_pause(0.3, 1.2) * 1000))
 
 
-def enforce_state(page, abbr):
-    """Force state value into the form: raw setter on all <select>, plus
-    hidden input injection. Works even if React re-renders wiped it."""
-    page.evaluate(
-        """(abbr) => {
-            // 1) Force any <select name="state"> to the value
-            document.querySelectorAll('select[name="state"]').forEach(s => {
-                const proto = HTMLSelectElement.prototype;
-                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                setter.call(s, abbr);
-                s.dispatchEvent(new Event('input', {bubbles:true}));
-                s.dispatchEvent(new Event('change', {bubbles:true}));
-                s.dispatchEvent(new Event('blur', {bubbles:true}));
-            });
-            // 2) Ensure a hidden input exists in the form with the value
-            const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-            let hidden = form.querySelector('input[name="state"][type="hidden"]');
-            if (!hidden) {
-                hidden = document.createElement('input');
-                hidden.type = 'hidden';
-                hidden.name = 'state';
-                form.appendChild(hidden);
-            }
-            hidden.value = abbr;
-        }""", abbr)
+def enforce_state(page, value):
+    """Re-assert the state <select> value using select_option on every
+    matching <select name="state">. No hidden-input injection — that created
+    a duplicate, empty form field whose value could shadow the real selection
+    in FormData and produce false "Missing fields" reports."""
+    abbr, full = _resolve_state(value)
+    if not abbr:
+        return
+    for el in page.locator('select[name="state"]').all():
+        try:
+            el.select_option(value=abbr, timeout=3000)
+        except Exception:
+            try:
+                el.select_option(label=full, timeout=3000)
+            except Exception:
+                pass
 
 
 def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
