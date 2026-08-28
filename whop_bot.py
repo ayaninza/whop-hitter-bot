@@ -748,6 +748,33 @@ def jitter(page):
     page.wait_for_timeout(int(human_pause(0.3, 1.2) * 1000))
 
 
+def enforce_state(page, abbr):
+    """Force state value into the form: raw setter on all <select>, plus
+    hidden input injection. Works even if React re-renders wiped it."""
+    page.evaluate(
+        """(abbr) => {
+            // 1) Force any <select name="state"> to the value
+            document.querySelectorAll('select[name="state"]').forEach(s => {
+                const proto = HTMLSelectElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                setter.call(s, abbr);
+                s.dispatchEvent(new Event('input', {bubbles:true}));
+                s.dispatchEvent(new Event('change', {bubbles:true}));
+                s.dispatchEvent(new Event('blur', {bubbles:true}));
+            });
+            // 2) Ensure a hidden input exists in the form with the value
+            const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+            let hidden = form.querySelector('input[name="state"][type="hidden"]');
+            if (!hidden) {
+                hidden = document.createElement('input');
+                hidden.type = 'hidden';
+                hidden.name = 'state';
+                form.appendChild(hidden);
+            }
+            hidden.value = abbr;
+        }""", abbr)
+
+
 def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
     """Core checker. Fills a fresh billing identity + the given card through a
     (rotated) proxy with a fresh stealth fingerprint, submits, and returns a
@@ -897,32 +924,7 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
 
         page.screenshot(path=f"{tag}_{last4}_pre.png", full_page=True)
 
-        # ENFORCE state in form right before submit — nuclear safety net
-        # Works even if React select reverts or mirrors were removed
-        def enforce_state(page, abbr):
-            page.evaluate(
-                """(abbr) => {
-                    // 1) Force any <select name="state"> to the value
-                    document.querySelectorAll('select[name="state"]').forEach(s => {
-                        const proto = HTMLSelectElement.prototype;
-                        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                        setter.call(s, abbr);
-                        s.dispatchEvent(new Event('input', {bubbles:true}));
-                        s.dispatchEvent(new Event('change', {bubbles:true}));
-                        s.dispatchEvent(new Event('blur', {bubbles:true}));
-                    });
-                    // 2) Ensure a hidden input exists in the form with the value
-                    const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                    let hidden = form.querySelector('input[name="state"][type="hidden"]');
-                    if (!hidden) {
-                        hidden = document.createElement('input');
-                        hidden.type = 'hidden';
-                        hidden.name = 'state';
-                        form.appendChild(hidden);
-                    }
-                    hidden.value = abbr;
-                }""", abbr)
-
+        # Final enforce right before submit (redundant safety)
         enforce_state(page, addr["state"])
         page.wait_for_timeout(500)
 
