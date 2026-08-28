@@ -533,59 +533,51 @@ def fill_field_strict(page, key, value):
             try:
                 tag = el.element_handle().evaluate("n => n.tagName.toLowerCase()")
                 if key == "state" and tag == "select":
-                    # CRITICAL: select_option does NOT work on Whop's React-controlled
-                    # <select> (it reverts to '' on re-render). Use the raw prototype
-                    # setter + full event suite directly, then verify via FormData.
+                    # CRITICAL: select_option and raw setters DO NOT WORK on Whop's
+                    # React-controlled <select> (value reverts to '' on re-render).
+                    # The ONLY reliable way is REAL keyboard interaction: click,
+                    # type abbreviation, press Enter — triggers React's onChange.
                     _wait_state_option(page, st_abbr, st_full, timeout=30000)
                     ok = False
                     for attempt in range(3):
                         try:
-                            el.evaluate(
-                                """(node, abbr, full) => {
-                                    // Ensure the option exists in the DOM
-                                    let found = false;
-                                    for (const opt of node.options) {
-                                        if (opt.value === abbr || opt.text === full) {
-                                            found = true; break;
-                                        }
-                                    }
-                                    if (!found) {
-                                        const o = document.createElement('option');
-                                        o.value = abbr; o.textContent = full;
-                                        node.appendChild(o);
-                                    }
-                                    // Raw value setter + full React event suite
-                                    const proto = HTMLSelectElement.prototype;
-                                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                                    setter.call(node, abbr);
-                                    node.dispatchEvent(new Event('input', {bubbles:true}));
-                                    node.dispatchEvent(new Event('change', {bubbles:true}));
-                                    node.dispatchEvent(new Event('blur', {bubbles:true}));
-                                }""", st_abbr, st_full)
-                            page.wait_for_timeout(200)
+                            el.wait_for(state="visible", timeout=5000)
+                            el.click(timeout=3000)
+                            page.wait_for_timeout(300)
+                            page.keyboard.type(st_abbr, delay=100)
+                            page.wait_for_timeout(300)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(500)
                             # Verify via FormData (what actually submits)
                             cur = page.evaluate(
                                 """() => {
                                     const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
-                                    const fd = new FormData(f);
-                                    return fd.get('state') || '';
+                                    return new FormData(f).get('state') || '';
                                 }""")
                             if _norm(cur) == _norm(st_abbr):
                                 ok = True
                                 break
                             page.wait_for_timeout(300)
-                        except Exception:
-                            pass
-                    # Last resort: click the select and arrow down to the option
+                        except Exception as e:
+                            print(f"[state] keyboard attempt {attempt+1} failed: {e}", flush=True)
+                            page.wait_for_timeout(300)
                     if not ok:
+                        # Last resort: raw setter + hidden input injection
                         try:
-                            el.click(timeout=2000)
-                            page.keyboard.press("ArrowDown")
-                            for _ in range(5):
-                                page.keyboard.press("ArrowDown")
-                                page.wait_for_timeout(50)
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(200)
+                            el.evaluate(JS_SET, st_abbr)
+                            page.evaluate(
+                                """(abbr) => {
+                                    const form = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
+                                    let hidden = form.querySelector('input[name="state"][type="hidden"]');
+                                    if (!hidden) {
+                                        hidden = document.createElement('input');
+                                        hidden.type = 'hidden';
+                                        hidden.name = 'state';
+                                        form.appendChild(hidden);
+                                    }
+                                    hidden.value = abbr;
+                                }""", st_abbr)
+                            page.wait_for_timeout(300)
                             cur = page.evaluate(
                                 """() => {
                                     const f = document.querySelector('form') || document.querySelector('[data-address-form]') || document.body;
