@@ -1037,7 +1037,7 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         else:
             status, reason = "error", "Unclear result (no clear success/error signal)"
 
-    print(f"[{tag}] DONE status={status}", flush=True)
+    print(f"[{tag}] DONE status={status} reason={reason}", flush=True)
     return {"cc": cc["number"], "last4": last4, "status": status,
             "response": reason, "screenshot": shot, "proxy": proxy["server"],
             "email": email}

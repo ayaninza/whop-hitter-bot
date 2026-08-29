@@ -334,7 +334,12 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         last_nav_err = None
         for attempt in range(2):
             try:
-                page.goto(BUY_VIP_URL, wait_until="domcontentloaded", timeout=60000)
+                # "commit" returns as soon as navigation is committed (response
+                # received) instead of waiting for the full page. The heavy
+                # toolsuite/buy-vip page often hangs on "domcontentloaded"
+                # through a slow proxy; "commit" lets click_get_access wait for
+                # the actual "Get access" button to be ready instead.
+                page.goto(BUY_VIP_URL, wait_until="commit", timeout=60000)
                 nav_ok = True
                 break
             except Exception as e:
