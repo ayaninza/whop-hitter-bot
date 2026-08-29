@@ -172,6 +172,23 @@ def test_proxy(s):
         return False, str(e)[:120]
 
 
+def load_failed(res):
+    """True only when the browser never got past page-load (goto timeout, form
+    not mounted, 'Get access' not found). In those cases NO charge happened, so
+    it is safe to retry the same card on the NEXT proxy. We deliberately exclude
+    post-submit outcomes (declined / unclear / watchdog) where a charge may have
+    already occurred — never retry those."""
+    if res.get("status") != "error":
+        return False
+    r = (res.get("response") or "").lower()
+    if "watchdog" in r:
+        return False
+    markers = ("could not load", "checkout form did not load", "could not click",
+               "navigating to", "timeout", "timed out", "exceeded", "goto",
+               "proxy connection", "timeouterror")
+    return any(m in r for m in markers)
+
+
 def add_proxies_tested(chat_id, text):
     udb = user_db(chat_id)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -364,20 +381,30 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     # each result shown live as it completes; per-card watchdog so a hang
     # can't freeze the rest of the run.
     ex = ThreadPoolExecutor(max_workers=1)
+    npx = len(proxy_list)
     for i, cc in enumerate(target, 1):
         if ABORT.get(chat_id):
             print(f"ABORT: stopping at {i}/{n}", flush=True)
             break
         refresh(lines, i - 1, current=cc["number"][-4:])
-        px = proxy_list[(i - 1) % len(proxy_list)]
-        fut = ex.submit(run_one, cc, px)
-        try:
-            res = fut.result(timeout=150)
-        except Exception as e:
-            res = {"cc": cc["number"], "last4": cc["number"][-4:],
-                   "status": "error", "response": f"watchdog timeout: {e}",
-                   "screenshot": None, "proxy": px["server"]}
-            print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
+        # Rotate on load-failure (page never loaded -> no charge): try the next
+        # proxy. Never retry after a submit/declined/unclear result.
+        start = (i - 1) % npx
+        res = None
+        for k in range(npx):
+            px = proxy_list[(start + k) % npx]
+            fut = ex.submit(run_one, cc, px)
+            try:
+                res = fut.result(timeout=150)
+            except Exception as e:
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": f"watchdog timeout: {e}",
+                       "screenshot": None, "proxy": px["server"]}
+                print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
+            if not load_failed(res):
+                break
+            print(f"card …{cc['number'][-4:]}: load failed on {px['server']}, "
+                  f"trying next proxy", flush=True)
         ABORT.pop(chat_id, None)
         record_result(chat_id, cc, res)
         send_result(chat_id, res)
@@ -442,17 +469,29 @@ def run_ref_flow(chat_id, ccs, proxy_list):
             print(f"ABORT(ref): stopping at {i}/{n}", flush=True)
             break
         refresh(i - 1, current=cc["number"][-4:])
-        px = proxy_list[(i - 1) % len(proxy_list)] if proxy_list else None
-        try:
-            res = F.run_final(cc_override=cc, proxy=px, headless=True,
-                              submit=True, tag=f"ref_{cc['number'][-4:]}")
-        except Exception as e:
-            import traceback as _tb
-            _tb_text = _tb.format_exc()
-            print("REF WORKER ERROR:", _tb_text, flush=True)
-            res = {"cc": cc["number"], "last4": cc["number"][-4:],
-                   "status": "error", "response": _tb_text,
-                   "screenshot": None, "proxy": (px or {}).get("server")}
+
+        # Rotate proxies on load-failure: the heavy buy-vip page often won't
+        # load through a slow/datacenter proxy, but another one will. Only
+        # retry when the browser never reached the form (no charge occurred).
+        npx = len(proxy_list)
+        start = (i - 1) % npx if npx else 0
+        res = None
+        for k in range(npx if npx else 1):
+            px = proxy_list[(start + k) % npx] if npx else None
+            try:
+                res = F.run_final(cc_override=cc, proxy=px, headless=True,
+                                  submit=True, tag=f"ref_{cc['number'][-4:]}")
+            except Exception as e:
+                import traceback as _tb
+                _tb_text = _tb.format_exc()
+                print("REF WORKER ERROR:", _tb_text, flush=True)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": _tb_text,
+                       "screenshot": None, "proxy": (px or {}).get("server")}
+            if not load_failed(res):
+                break
+            print(f"ref {cc['number'][-4:]}: load failed on "
+                  f"{(px or {}).get('server')}, trying next proxy", flush=True)
         ABORT.pop(chat_id, None)
         record_result(chat_id, cc, res)
         send_result(chat_id, res)
