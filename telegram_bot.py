@@ -167,8 +167,6 @@ def test_proxy(s):
         if r.status_code >= 400:
             return False, (f"HTTP {r.status_code} — proxy likely needs auth "
                            f"(add as user:pass@host:port) or your IP isn't allowlisted")
-        if "whop" not in (r.text or "").lower()[:500]:
-            return False, "proxy did not return whop.com (auth/IP block?)"
         return True, f"HTTP {r.status_code}"
     except Exception as e:
         return False, str(e)[:120]
@@ -745,7 +743,7 @@ def cmd_live(m):
                      f"╭─ 🔁 *LIVE RETRY*\n"
                      f"└─ retrying {len(ins)} insufficient card(s)",
                      parse_mode="Markdown")
-    _start_heavy(m.chat.id, run_check, m.chat.id, url, all_proxies(), ins)
+    _start_heavy(m.chat.id, run_check, m.chat.id, url, all_proxies(m.chat.id), ins)
 
 
 @bot.message_handler(commands=["db"])
@@ -842,7 +840,7 @@ def cb_proxy(c):
                               c.message.message_id)
         proxies = system_proxies()
     else:
-        ups = user_proxies()
+        ups = user_proxies(chat_id)
         if not ups:
             bot.edit_message_text(
                 "⚠️ no proxies saved yet — add some with /addproxy first",
