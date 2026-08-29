@@ -212,9 +212,12 @@ def fmt_box(res):
     last4 = res["last4"]
     proxy = (res.get("proxy") or "").replace("http://", "").replace("https://", "")
     if s == "success":
-        head, body, foot = ("✅ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝",
-                            "├─ 💰 𝐂𝐡𝐚𝐫𝐠𝐞𝐝 𝐒𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥𝐥𝐲",
-                            "╰─ Access granted — saved to ✅ CARDS THAT WORKED.")
+        email = res.get("email") or ""
+        head = "✅ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝"
+        body = "├─ 💰 𝐂𝐡𝐚𝐫𝐠𝐞𝐝 𝐒𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥𝐥𝐲"
+        if email:
+            body += f"\n├─ 📧 𝐄𝐦𝐚𝐢𝐥  `{email}`"
+        foot = "╰─ Access granted — saved to ✅ CARDS THAT WORKED."
     elif s == "insufficient":
         head, body, foot = ("❌ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝",
                             "├─ 💸 𝐈𝐧𝐬𝐮𝐟𝐟𝐢𝐜𝐢𝐞𝐧𝐭 𝐅𝐮𝐧𝐝𝐬",
@@ -277,12 +280,13 @@ def record_result(chat_id, cc, res):
                 c["status"] = res.get("status", "")
                 c["response"] = (res.get("response") or "")[:500]
                 c["proxy"] = res.get("proxy", "")
+                c["email"] = res.get("email", "")
                 c["ts"] = time.time()
                 c["live"] = (res.get("status") == "success")
                 break
         udb["last_run"].append({
             "raw": cc.get("raw"), "status": res.get("status", ""),
-            "proxy": res.get("proxy", ""),
+            "proxy": res.get("proxy", ""), "email": res.get("email", ""),
             "response": (res.get("response") or "")[:300],
         })
         save_db()
@@ -490,7 +494,11 @@ def build_db_text(chat_id):
     if live:
         t += "✅ *CARDS THAT WORKED ON WHOP:*\n"
         for c in live[:50]:
-            t += f"  `…{c['number'][-4:]}`  {c.get('raw','')}\n"
+            t += f"  `…{c['number'][-4:]}`  {c.get('raw','')}"
+            em = c.get("email") or ""
+            if em:
+                t += f"\n    📧 {em}"
+            t += "\n"
         if len(live) > 50:
             t += f"  …and {len(live)-50} more\n"
     else:

@@ -397,6 +397,7 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
 
         result = fill_and_submit(page, addr, email, cc, tag, submit)
         result["proxy"] = (proxy or {}).get("server")
+        result["email"] = email
         browser.close()
         return result
 

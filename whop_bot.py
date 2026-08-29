@@ -1039,7 +1039,8 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
 
     print(f"[{tag}] DONE status={status}", flush=True)
     return {"cc": cc["number"], "last4": last4, "status": status,
-            "response": reason, "screenshot": shot, "proxy": proxy["server"]}
+            "response": reason, "screenshot": shot, "proxy": proxy["server"],
+            "email": email}
 
 
 def main():
