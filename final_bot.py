@@ -326,10 +326,30 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         context.add_init_script(stealth)
         page = context.new_page()
         page.add_init_script(stealth)
-        page.set_default_timeout(30000)
+        page.set_default_timeout(45000)
 
         print(f"[{tag}] goto {BUY_VIP_URL}", flush=True)
-        page.goto(BUY_VIP_URL, wait_until="domcontentloaded", timeout=30000)
+        phost = (proxy or {}).get("server", "no-proxy")
+        nav_ok = False
+        last_nav_err = None
+        for attempt in range(2):
+            try:
+                page.goto(BUY_VIP_URL, wait_until="domcontentloaded", timeout=60000)
+                nav_ok = True
+                break
+            except Exception as e:
+                last_nav_err = str(e).splitlines()[-1][:160]
+                print(f"[{tag}] goto attempt {attempt} failed: {e}", flush=True)
+                page.wait_for_timeout(2000)
+        if not nav_ok:
+            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
+            browser.close()
+            return {"cc": cc["number"], "last4": last4, "status": "error",
+                    "response": (f"Could not load buy-vip page via proxy {phost}. "
+                                 f"Proxy likely needs auth (add as "
+                                 f"user:pass@host:port) or this server's IP isn't "
+                                 f"allowlisted. ({last_nav_err or 'timeout'})"),
+                    "screenshot": f"{tag}_{last4}.png"}
         page.wait_for_timeout(3000)
         W.jitter(page)
         page.mouse.wheel(0, random.randint(120, 360))

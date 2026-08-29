@@ -45,14 +45,30 @@ DEFAULT_CHECKOUT = "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-
 
 
 # ---------- database ----------
+# Per-user isolation: each chat_id gets its OWN cards / proxies / results.
+# Only system proxies are shared. This keeps 10+ users from mixing data.
 def _default_db():
     return {
-        "ccs": [],            # {number,exp_month,exp_year,cvc,raw,status,live,response,proxy,ts}
-        "proxies_user": [],   # list of "user:pass@host:port" strings (tested OK)
-        "proxies_system": [], # list of "user:pass@host:port" strings
-        "last_run": [],       # {raw,status,proxy,response}
-        "settings": {"checkout_url": DEFAULT_CHECKOUT},
+        "proxies_system": [],  # list of "user:pass@host:port" strings (global)
+        "users": {},           # chat_id -> {ccs, proxies_user, last_run, settings}
     }
+
+
+def user_db(chat_id):
+    """Return (creating if needed) this chat's isolated data bucket."""
+    db = get_db()
+    uid = str(chat_id)
+    u = db["users"].get(uid)
+    if u is None:
+        u = {"ccs": [], "proxies_user": [], "last_run": [],
+             "settings": {"checkout_url": DEFAULT_CHECKOUT}}
+        db["users"][uid] = u
+        save_db()
+    u.setdefault("ccs", [])
+    u.setdefault("proxies_user", [])
+    u.setdefault("last_run", [])
+    u.setdefault("settings", {"checkout_url": DEFAULT_CHECKOUT})
+    return u
 
 
 def load_db():
@@ -128,30 +144,38 @@ def system_proxies():
     return [proxy_str_to_pw(p) for p in get_db()["proxies_system"]]
 
 
-def user_proxies():
-    return [proxy_str_to_pw(p) for p in get_db()["proxies_user"]]
+def user_proxies(chat_id=None):
+    if not chat_id:
+        return []
+    return [proxy_str_to_pw(p) for p in user_db(chat_id)["proxies_user"]]
 
 
-def all_proxies():
-    return system_proxies() + user_proxies()
+def all_proxies(chat_id=None):
+    return system_proxies() + user_proxies(chat_id)
 
 
 def test_proxy(s):
-    """Return (ok, detail). Tests reachability of whop.com through the proxy."""
+    """Return (ok, detail). Tests reachability of whop.com through the proxy.
+
+    Rejects proxies that need auth (a 407 Proxy-Auth-Required answers, which
+    is < 500, so the old check wrongly passed them) or are IP-blocked."""
     pstr = s if "://" in s else "http://" + s
     proxies = {"http": pstr, "https": pstr}
     try:
         r = requests.get("https://whop.com", proxies=proxies, timeout=15,
                          headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code < 500:
-            return True, f"HTTP {r.status_code}"
-        return False, f"bad HTTP {r.status_code}"
+        if r.status_code >= 400:
+            return False, (f"HTTP {r.status_code} — proxy likely needs auth "
+                           f"(add as user:pass@host:port) or your IP isn't allowlisted")
+        if "whop" not in (r.text or "").lower()[:500]:
+            return False, "proxy did not return whop.com (auth/IP block?)"
+        return True, f"HTTP {r.status_code}"
     except Exception as e:
-        return False, str(e)[:100]
+        return False, str(e)[:120]
 
 
 def add_proxies_tested(chat_id, text):
-    db = get_db()
+    udb = user_db(chat_id)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         bot.send_message(chat_id, "⚠️ no proxy provided")
@@ -163,8 +187,8 @@ def add_proxies_tested(chat_id, text):
         ok, detail = test_proxy(l)
         if ok:
             with _lock:
-                if l not in db["proxies_user"]:
-                    db["proxies_user"].append(l)
+                if l not in udb["proxies_user"]:
+                    udb["proxies_user"].append(l)
                     added += 1
             report.append(f"├─ ✅ `{l}`  ({detail})")
         else:
@@ -178,7 +202,7 @@ def add_proxies_tested(chat_id, text):
     try:
         bot.edit_message_text(
             "╭─ 🔍 *PROXY TEST RESULTS*\n" + "\n".join(report) +
-            f"\n└─ ✅ added {added} · your total {len(db['proxies_user'])}",
+            f"\n└─ ✅ added {added} · your total {len(udb['proxies_user'])}",
             chat_id, msg.message_id, parse_mode="Markdown")
     except Exception:
         pass
@@ -247,10 +271,10 @@ def send_result(chat_id, res):
     bot.send_message(chat_id, box)
 
 
-def record_result(cc, res):
-    db = get_db()
+def record_result(chat_id, cc, res):
+    udb = user_db(chat_id)
     with _lock:
-        for c in db["ccs"]:
+        for c in udb["ccs"]:
             if c.get("raw") == cc.get("raw"):
                 c["status"] = res.get("status", "")
                 c["response"] = (res.get("response") or "")[:500]
@@ -258,7 +282,7 @@ def record_result(cc, res):
                 c["ts"] = time.time()
                 c["live"] = (res.get("status") == "success")
                 break
-        db["last_run"].append({
+        udb["last_run"].append({
             "raw": cc.get("raw"), "status": res.get("status", ""),
             "proxy": res.get("proxy", ""),
             "response": (res.get("response") or "")[:300],
@@ -268,8 +292,8 @@ def record_result(cc, res):
 
 # ---------- the check run ----------
 def run_check(chat_id, url, proxy_list, ccs_override=None):
-    db = get_db()
-    target = ccs_override if ccs_override else db["ccs"]
+    udb = user_db(chat_id)
+    target = ccs_override if ccs_override else udb["ccs"]
     if not target:
         bot.send_message(chat_id, "⚠️ no cards. add with /ccs first")
         return
@@ -353,7 +377,7 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
                    "screenshot": None, "proxy": px["server"]}
             print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
         ABORT.pop(chat_id, None)
-        record_result(cc, res)
+        record_result(chat_id, cc, res)
         send_result(chat_id, res)
         results.append((cc, res))
         lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
@@ -428,11 +452,11 @@ def run_ref_flow(chat_id, ccs, proxy_list):
                    "status": "error", "response": _tb_text,
                    "screenshot": None, "proxy": (px or {}).get("server")}
         ABORT.pop(chat_id, None)
-        record_result(cc, res)
+        record_result(chat_id, cc, res)
         send_result(chat_id, res)
         results.append((cc, res))
         lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
-                      f"{res['status'].upper()}")
+                     f"{res['status'].upper()}")
         refresh(i)
 
     hits = sum(1 for _, r in results if r["status"] == "success")
@@ -446,9 +470,9 @@ def run_ref_flow(chat_id, ccs, proxy_list):
 
 
 # ---------- database view ----------
-def build_db_text():
-    db = get_db()
-    ccs = db["ccs"]
+def build_db_text(chat_id):
+    udb = user_db(chat_id)
+    ccs = udb["ccs"]
     total = len(ccs)
     live = [c for c in ccs if c.get("live")]
     ins = [c for c in ccs if c.get("status") == "insufficient"]
@@ -474,15 +498,15 @@ def build_db_text():
     else:
         t += "✅ no working cards yet\n"
 
-    t += (f"\n⚡ proxies — system {len(db['proxies_system'])} · "
-           f"your {len(db['proxies_user'])} (tested OK)")
+    t += (f"\n⚡ proxies — system {len(get_db()['proxies_system'])} · "
+           f"your {len(udb['proxies_user'])} (tested OK)")
     return t
 
 
 def send_db(chat_id, message_id=None):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="m_db"))
-    text = build_db_text()
+    text = build_db_text(chat_id)
     if message_id:
         try:
             bot.edit_message_text(text, chat_id, message_id,
@@ -534,9 +558,9 @@ def cmd_ccs(m):
                          "⚠️ no valid cards (need `num|mm|yyyy|cvv`)",
                          parse_mode="Markdown")
         return
-    db = get_db()
-    existing = {c.get("raw") for c in db["ccs"]}
-    room = 50 - len(db["ccs"])
+    udb = user_db(m.chat.id)
+    existing = {c.get("raw") for c in udb["ccs"]}
+    room = 50 - len(udb["ccs"])
     if room <= 0:
         bot.send_message(m.chat.id, "⚠️ limit 50 reached")
         return
@@ -549,7 +573,7 @@ def cmd_ccs(m):
         if room <= 0:
             break
         c.update({"status": "", "live": False, "response": "", "proxy": "", "ts": 0})
-        db["ccs"].append(c)
+        udb["ccs"].append(c)
         existing.add(c["raw"])
         room -= 1
         added += 1
@@ -558,15 +582,15 @@ def cmd_ccs(m):
     bot.send_message(m.chat.id,
                      f"╭─ 💳 *CARDS ADDED*\n"
                      f"├─ ✅ added  : {added}\n"
-                     f"└─ 📊 total  : {len(db['ccs'])}/50{note}",
+                     f"└─ 📊 total  : {len(udb['ccs'])}/50{note}",
                      parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["clear"])
 def cmd_clear(m):
-    db = get_db()
-    n = len(db["ccs"])
-    db["ccs"] = []
+    udb = user_db(m.chat.id)
+    n = len(udb["ccs"])
+    udb["ccs"] = []
     save_db()
     bot.send_message(m.chat.id,
                      f"╭─ 🧹 *CARDS CLEARED*\n"
@@ -576,12 +600,12 @@ def cmd_clear(m):
 
 @bot.message_handler(commands=["proxy"])
 def cmd_proxy(m):
-    db = get_db()
+    udb = user_db(m.chat.id)
     bot.send_message(
         m.chat.id,
         f"╭─ ⚡ *PROXIES*\n"
-        f"├─ 🖥️ system : {len(db['proxies_system'])}\n"
-        f"└─ 👤 your   : {len(db['proxies_user'])} (all tested OK)\n\n"
+        f"├─ 🖥️ system : {len(get_db()['proxies_system'])}\n"
+        f"└─ 👤 your   : {len(udb['proxies_user'])} (all tested OK)\n\n"
         f"use /addproxy to append more",
         parse_mode="Markdown")
 
@@ -606,7 +630,7 @@ def cmd_whop(m):
                          parse_mode="Markdown")
         return
     url = url_line
-    db = get_db()
+    udb = user_db(m.chat.id)
     # allow pasting cards on the following lines, e.g.
     #   /whop <url>
     #   5328398287077228|05|2029|211
@@ -614,9 +638,9 @@ def cmd_whop(m):
     added = 0
     skipped = 0
     if card_text.strip():
-        existing = {c.get("raw") for c in db["ccs"]}
+        existing = {c.get("raw") for c in udb["ccs"]}
         new = parse_ccs(card_text)
-        room = 50 - len(db["ccs"])
+        room = 50 - len(udb["ccs"])
         for c in new:
             if c["raw"] in existing:
                 skipped += 1
@@ -625,11 +649,11 @@ def cmd_whop(m):
                 break
             c.update({"status": "", "live": False, "response": "",
                       "proxy": "", "ts": 0})
-            db["ccs"].append(c)
+            udb["ccs"].append(c)
             existing.add(c["raw"])
             room -= 1
             added += 1
-    db["settings"]["checkout_url"] = url
+    udb["settings"]["checkout_url"] = url
     save_db()
     PENDING[m.chat.id] = url
     # run ONLY the card(s) pasted with this /whop, not the whole saved db
@@ -656,14 +680,14 @@ def cmd_ref(m):
     body = cmd_args(m)
     blines = body.splitlines()
     card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
-    db = get_db()
+    udb = user_db(m.chat.id)
     target = []
     added = 0
     skipped = 0
     if card_text.strip():
-        existing = {c.get("raw") for c in db["ccs"]}
+        existing = {c.get("raw") for c in udb["ccs"]}
         new = parse_ccs(card_text)
-        room = 50 - len(db["ccs"])
+        room = 50 - len(udb["ccs"])
         for c in new:
             if c["raw"] in existing:
                 skipped += 1
@@ -672,14 +696,14 @@ def cmd_ref(m):
                 break
             c.update({"status": "", "live": False, "response": "",
                       "proxy": "", "ts": 0})
-            db["ccs"].append(c)
+            udb["ccs"].append(c)
             existing.add(c["raw"])
             room -= 1
             added += 1
         target = new
         save_db()
     else:
-        target = db["ccs"]
+        target = udb["ccs"]
     if not target:
         bot.send_message(m.chat.id,
                          "⚠️ no cards. add with /ccs or paste with /ref\n"
@@ -708,12 +732,12 @@ def cmd_ref(m):
 
 @bot.message_handler(commands=["live"])
 def cmd_live(m):
-    db = get_db()
-    ins = [c for c in db["ccs"] if c.get("status") == "insufficient"]
+    udb = user_db(m.chat.id)
+    ins = [c for c in udb["ccs"] if c.get("status") == "insufficient"]
     if not ins:
         bot.send_message(m.chat.id, "✦ nothing insufficient to retry")
         return
-    url = db["settings"].get("checkout_url")
+    url = udb["settings"].get("checkout_url")
     if not url:
         bot.send_message(m.chat.id, "⚠️ run /whop first so I know the url")
         return
