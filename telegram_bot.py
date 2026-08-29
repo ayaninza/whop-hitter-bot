@@ -35,7 +35,7 @@ import final_bot as F
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
 TOKEN = os.environ.get("BOT_TOKEN", "8831100897:AAFu6XD1NyPhOxfHfPhnQDLRdulIBGbXPs8")
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, threaded=True)
 
 DB_FILE = "db.json"
 _lock = threading.RLock()
@@ -162,9 +162,10 @@ def add_proxies_tested(chat_id, text):
     for l in lines:
         ok, detail = test_proxy(l)
         if ok:
-            if l not in db["proxies_user"]:
-                db["proxies_user"].append(l)
-                added += 1
+            with _lock:
+                if l not in db["proxies_user"]:
+                    db["proxies_user"].append(l)
+                    added += 1
             report.append(f"├─ ✅ `{l}`  ({detail})")
         else:
             report.append(f"├─ ⛔ `{l}`  — {detail}")
@@ -248,20 +249,21 @@ def send_result(chat_id, res):
 
 def record_result(cc, res):
     db = get_db()
-    for c in db["ccs"]:
-        if c.get("raw") == cc.get("raw"):
-            c["status"] = res.get("status", "")
-            c["response"] = (res.get("response") or "")[:500]
-            c["proxy"] = res.get("proxy", "")
-            c["ts"] = time.time()
-            c["live"] = (res.get("status") == "success")
-            break
-    db["last_run"].append({
-        "raw": cc.get("raw"), "status": res.get("status", ""),
-        "proxy": res.get("proxy", ""),
-        "response": (res.get("response") or "")[:300],
-    })
-    save_db()
+    with _lock:
+        for c in db["ccs"]:
+            if c.get("raw") == cc.get("raw"):
+                c["status"] = res.get("status", "")
+                c["response"] = (res.get("response") or "")[:500]
+                c["proxy"] = res.get("proxy", "")
+                c["ts"] = time.time()
+                c["live"] = (res.get("status") == "success")
+                break
+        db["last_run"].append({
+            "raw": cc.get("raw"), "status": res.get("status", ""),
+            "proxy": res.get("proxy", ""),
+            "response": (res.get("response") or "")[:300],
+        })
+        save_db()
 
 
 # ---------- the check run ----------
@@ -591,7 +593,7 @@ def cmd_addproxy(m):
         bot.send_message(m.chat.id, "✦ /addproxy `user:pass@host:port`",
                          parse_mode="Markdown")
         return
-    add_proxies_tested(m.chat.id, text)
+    _start_light(m.chat.id, add_proxies_tested, m.chat.id, text)
 
 
 @bot.message_handler(commands=["whop"])
@@ -689,15 +691,19 @@ def cmd_ref(m):
         note += f"├─ ✅ added {added} card(s)\n"
     if skipped:
         note += f"├─ ⚠️ {skipped} dup skipped\n"
+    # store target and ask for a proxy source (system vs your own added proxies)
+    PENDING_REF[m.chat.id] = target
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⚡ System Proxies", callback_data="px_sys"))
+    kb.add(types.InlineKeyboardButton("➕ Use My Proxies", callback_data="px_add"))
     bot.send_message(
         m.chat.id,
         f"╭─ 🛒 *REF / BUY-VIP READY*\n"
         f"│\n"
         f"{note}"
         f"├─ 💳 cards   : {len(target)}\n"
-        f"└─ ▶️ running buy-vip flow (sends screenshot after)…",
-        parse_mode="Markdown")
-    run_ref_flow(m.chat.id, target, all_proxies())
+        f"└─ choose a proxy source 👇",
+        parse_mode="Markdown", reply_markup=kb)
 
 
 @bot.message_handler(commands=["live"])
@@ -715,7 +721,7 @@ def cmd_live(m):
                      f"╭─ 🔁 *LIVE RETRY*\n"
                      f"└─ retrying {len(ins)} insufficient card(s)",
                      parse_mode="Markdown")
-    run_check(m.chat.id, url, all_proxies(), ccs_override=ins)
+    _start_heavy(m.chat.id, run_check, m.chat.id, url, all_proxies(), ins)
 
 
 @bot.message_handler(commands=["db"])
@@ -725,33 +731,110 @@ def cmd_db(m):
 
 PENDING = {}        # chat_id -> checkout url (awaiting proxy choice)
 PENDING_CARDS = {}   # chat_id -> cards given inline with /whop (run only those)
+PENDING_REF = {}     # chat_id -> target cards for a /ref run (awaiting proxy choice)
 ABORT = {}           # chat_id -> True when user hits Stop
+
+
+# ---------- concurrency + anti-spam (offload heavy work; serve many users) ----------
+# Heavy runs (check / ref) are bounded so N users don't launch N browsers at
+# once. Light work (proxy tests) runs in its own pool so it never blocks on a
+# heavy run. Per-user guard: one active run per chat. Global guard: at most
+# MAX_CONCURRENT_RUNS run at once; extras queue automatically on the pool.
+MAX_CONCURRENT_RUNS = int(os.environ.get("MAX_CONCURRENT_RUNS", "3"))
+heavy_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_RUNS)
+light_pool = ThreadPoolExecutor(max_workers=8)
+
+_user_active = {}     # chat_id -> True (this user already has a run going)
+_heavy_active = 0     # count of submitted heavy jobs (incl. queued)
+_conc_lock = threading.Lock()
+
+
+def _start_heavy(chat_id, fn, *args):
+    """Run a heavy task in the bounded pool and return immediately.
+
+    Logic of fn is unchanged; only its *execution context* changes. A user can
+    have at most one run at a time; globally at most MAX_CONCURRENT_RUNS run
+    concurrently, the rest queue and start automatically.
+    """
+    global _heavy_active
+    with _conc_lock:
+        if _user_active.get(chat_id):
+            try:
+                bot.send_message(
+                    chat_id,
+                    "⚠️ you already have a run in progress — use 🛑 Stop or wait for it to finish.")
+            except Exception:
+                pass
+            return
+        _user_active[chat_id] = True
+        queued = _heavy_active >= MAX_CONCURRENT_RUNS
+        _heavy_active += 1
+    if queued:
+        try:
+            bot.send_message(
+                chat_id,
+                f"⏳ all {MAX_CONCURRENT_RUNS} worker slots busy — your run is queued and will start automatically.")
+        except Exception:
+            pass
+
+    def _job():
+        try:
+            fn(*args)
+        except Exception as e:
+            print("RUN JOB ERROR:", repr(e), flush=True)
+        finally:
+            global _heavy_active
+            with _conc_lock:
+                _user_active.pop(chat_id, None)
+                _heavy_active -= 1
+    heavy_pool.submit(_job)
+
+
+def _start_light(chat_id, fn, *args):
+    """Run a light/IO task (proxy tests) without blocking the bot."""
+    light_pool.submit(lambda: _safe(fn, *args))
+
+
+def _safe(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:
+        print("LIGHT JOB ERROR:", repr(e), flush=True)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ("px_sys", "px_add"))
 def cb_proxy(c):
-    url = PENDING.get(c.message.chat.id) or get_db()["settings"].get("checkout_url")
-    if not url:
-        bot.edit_message_text("⚠️ run /whop first", c.message.chat.id,
+    chat_id = c.message.chat.id
+    url = PENDING.get(chat_id)
+    is_ref = chat_id in PENDING_REF
+    if not url and not is_ref:
+        bot.edit_message_text("⚠️ run /whop or /ref first", chat_id,
                               c.message.message_id)
         return
-    if c.data == "px_sys":
-        bot.edit_message_text("✦ using system proxies", c.message.chat.id,
+
+    use_system = (c.data == "px_sys")
+    if use_system:
+        bot.edit_message_text("✦ using system proxies", chat_id,
                               c.message.message_id)
-        run_check(c.message.chat.id, url, system_proxies(),
-                  ccs_override=PENDING_CARDS.get(c.message.chat.id) or None)
+        proxies = system_proxies()
     else:
-        # use the proxies already added via /addproxy
         ups = user_proxies()
         if not ups:
             bot.edit_message_text(
                 "⚠️ no proxies saved yet — add some with /addproxy first",
-                c.message.chat.id, c.message.message_id)
+                chat_id, c.message.message_id)
             return
-        bot.edit_message_text("✦ using your saved proxies", c.message.chat.id,
+        bot.edit_message_text("✦ using your saved proxies", chat_id,
                               c.message.message_id)
-        run_check(c.message.chat.id, url, ups,
-                  ccs_override=PENDING_CARDS.get(c.message.chat.id) or None)
+        proxies = ups
+
+    if is_ref:
+        target = PENDING_REF.pop(chat_id, [])
+        _start_heavy(chat_id, run_ref_flow, chat_id, target, proxies)
+    else:
+        u = PENDING.pop(chat_id, None)
+        _start_heavy(chat_id, run_check, chat_id, u, proxies,
+                     PENDING_CARDS.pop(chat_id, None) or None)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "stop")
