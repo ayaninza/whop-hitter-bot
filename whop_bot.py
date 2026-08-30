@@ -1001,15 +1001,16 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         ("verify", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
-        # Card itself rejected / details invalid -> NEVER success.
+        # Card itself rejected / details invalid -> NEVER success. Match only
+        # AUTHENTIC rejection phrases ("Your card details are incomplete or
+        # invalid"); do NOT match the generic "Card information" section label,
+        # which is present on every (even correctly-filled) checkout.
+        ("your card details are incomplete or invalid", "declined", "Payment details invalid"),
+        ("card details are incomplete", "declined", "Payment details invalid"),
         ("incomplete or invalid", "declined", "Payment details invalid"),
-        ("card details are", "declined", "Payment details invalid"),
-        ("card information", "declined", "Invalid card details"),
-        ("invalid card", "declined", "Invalid card details"),
-        ("card is invalid", "declined", "Invalid card details"),
         ("card number is invalid", "declined", "Invalid card number"),
-        ("not a valid card", "declined", "Invalid card number"),
-        ("enter a valid card", "declined", "Invalid card number"),
+        ("not a valid card number", "declined", "Invalid card number"),
+        ("enter a valid card number", "declined", "Invalid card number"),
         ("payment details invalid", "declined", "Payment details invalid"),
     ]
     # Approve ONLY on a positive success signal. A genuine purchase lands on the
