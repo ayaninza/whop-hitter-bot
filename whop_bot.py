@@ -69,7 +69,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 VIEWPORTS = [
-    (1366, 768), (1536, 864), (1440, 900), (1920, 1080), (1280, 720),
+    (1280, 720), (1366, 768), (1440, 900), (1280, 768), (1366, 720),
 ]
 # US timezones + a representative city center (lat, lon) for geolocation
 US_GEO = [
@@ -793,7 +793,11 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
             args=["--disable-blink-features=AutomationControlled",
                   "--disable-infobars", f"--window-size={vw},{vh}",
                   "--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage", "--disable-gpu"],
+                  "--disable-dev-shm-usage", "--disable-gpu",
+                  # memory trims so 2 browsers fit on a small container
+                  "--no-zygote", "--renderer-process-limit=1",
+                  "--disable-software-rasterizer", "--disable-dev-tools",
+                  "--js-flags=--max-old-space-size=256"],
         )
         context = browser.new_context(
             user_agent=ua,

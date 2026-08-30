@@ -314,7 +314,11 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
             args=["--disable-blink-features=AutomationControlled",
                   "--disable-infobars", f"--window-size={vw},{vh}",
                   "--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage", "--disable-gpu"])
+                  "--disable-dev-shm-usage", "--disable-gpu",
+                  # memory trims so 2 browsers fit on a small container
+                  "--no-zygote", "--renderer-process-limit=1",
+                  "--disable-software-rasterizer", "--disable-dev-tools",
+                  "--js-flags=--max-old-space-size=256"])
         context = browser.new_context(
             user_agent=ua, viewport={"width": vw, "height": vh},
             locale="en-US", timezone_id=tz,

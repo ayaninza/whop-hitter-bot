@@ -362,8 +362,9 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         for k in range(npx):
             px = proxy_list[(start_idx + k) % npx] if proxy_list else None
             try:
-                res = W.run_checkout(url, cc, proxy=px, headless=True,
-                                     tag=f"tg_{cc['number'][-4:]}")
+                with BROWSER_SEM:
+                    res = W.run_checkout(url, cc, proxy=px, headless=True,
+                                         tag=f"tg_{cc['number'][-4:]}")
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
@@ -518,8 +519,9 @@ def run_ref_flow(chat_id, ccs, proxy_list):
         for k in range(npx if npx else 1):
             px = proxy_list[(start + k) % npx] if npx else None
             try:
-                res = F.run_final(cc_override=cc, proxy=px, headless=True,
-                                  submit=True, tag=f"ref_{cc['number'][-4:]}")
+                with BROWSER_SEM:
+                    res = F.run_final(cc_override=cc, proxy=px, headless=True,
+                                      submit=True, tag=f"ref_{cc['number'][-4:]}")
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
@@ -851,6 +853,12 @@ ABORT = {}           # chat_id -> True when user hits Stop
 MAX_CONCURRENT_RUNS = int(os.environ.get("MAX_CONCURRENT_RUNS", "3"))
 heavy_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_RUNS)
 light_pool = ThreadPoolExecutor(max_workers=8)
+# Process-wide cap on SIMULTANEOUS browsers. Running 2+ Chromium at once on a
+# small railway container OOMs, so even if several runs/users queue up, we never
+# launch more browsers than the container can feed. Default 2 (one run's 2
+# workers); raise MAX_BROWSERS only if you bump container memory.
+MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
+BROWSER_SEM = threading.BoundedSemaphore(MAX_BROWSERS)
 
 _user_active = {}     # chat_id -> True (this user already has a run going)
 _heavy_active = 0     # count of submitted heavy jobs (incl. queued)
