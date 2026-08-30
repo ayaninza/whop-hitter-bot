@@ -7,5 +7,10 @@
     "startCommand": "python telegram_bot.py",
     "restartPolicyType": "ON_FAILURE",
     "healthcheckPath": null
+  },
+  "variables": {
+    "CHECK_WORKERS": "2",
+    "MAX_BROWSERS": "2",
+    "MAX_CONCURRENT_RUNS": "3"
   }
 }
