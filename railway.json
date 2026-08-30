@@ -9,7 +9,7 @@
     "healthcheckPath": null
   },
   "variables": {
-    "CHECK_WORKERS": "2",
+    "CHECK_WORKERS": "1",
     "MAX_BROWSERS": "2",
     "MAX_CONCURRENT_RUNS": "3"
   }

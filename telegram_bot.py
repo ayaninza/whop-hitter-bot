@@ -326,7 +326,7 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     kb_stop = types.InlineKeyboardMarkup()
     kb_stop.add(types.InlineKeyboardButton("🛑 Stop", callback_data="stop"))
 
-    workers = max(1, int(os.environ.get("CHECK_WORKERS", "2")))
+    workers = max(1, int(os.environ.get("CHECK_WORKERS", "1")))
     status_msg = bot.send_message(
         chat_id,
         f"╭─ 🚀 *RUN STARTED*\n"
