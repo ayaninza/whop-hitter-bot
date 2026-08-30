@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import requests
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import telebot
 from telebot import types
@@ -326,12 +326,13 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     kb_stop = types.InlineKeyboardMarkup()
     kb_stop.add(types.InlineKeyboardButton("🛑 Stop", callback_data="stop"))
 
+    workers = max(1, int(os.environ.get("CHECK_WORKERS", "2")))
     status_msg = bot.send_message(
         chat_id,
         f"╭─ 🚀 *RUN STARTED*\n"
         f"│\n"
         f"├─ 💳 cards    : {n}\n"
-        f"├─ ⚡ workers  : 1\n"
+        f"├─ ⚡ workers  : {workers}\n"
         f"├─ 🌐 proxies  : {len(proxy_list)}\n"
         f"└─ progress 0/{n} …",
         parse_mode="Markdown", reply_markup=kb_stop)
@@ -340,6 +341,7 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         head = (f"╭─ 🚀 *RUN IN PROGRESS*\n"
                 f"│\n"
                 f"├─ 💳 cards    : {n}\n"
+                f"├─ ⚡ workers  : {workers}\n"
                 f"├─ 🌐 proxies  : {len(proxy_list)}\n"
                 f"└─ progress {done}/{n}\n\n")
         body = "\n".join(lines)
@@ -352,66 +354,103 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         except Exception:
             pass
 
-    def run_one(cc, px):
-        try:
-            return W.run_checkout(url, cc, proxy=px, headless=True,
-                                  tag=f"tg_{cc['number'][-4:]}")
-        except Exception as e:
-            import traceback as _tb
-            _tb_text = _tb.format_exc()
-            msg = str(e)
-            if ("TargetClosedError" in type(e).__name__ or "context or browser closed" in msg
-                    or "Executable doesn't exist" in msg):
-                try:
-                    libs = W.chromium_missing_libs()
-                    if libs:
-                        _tb_text += "\n\nCHROMIUM LIB CHECK:\n" + libs
-                except Exception:
-                    pass
-            print("WORKER ERROR:", _tb_text, flush=True)
-            return {"cc": cc["number"], "last4": cc["number"][-4:],
-                    "status": "error", "response": _tb_text,
-                    "screenshot": None, "proxy": px["server"]}
+    def process_card(cc, start_idx):
+        """Check one card, rotating to the next proxy on load-failure only. This
+        runs in its own worker so N cards are checked in parallel."""
+        npx = len(proxy_list) or 1
+        res = None
+        for k in range(npx):
+            px = proxy_list[(start_idx + k) % npx] if proxy_list else None
+            try:
+                res = W.run_checkout(url, cc, proxy=px, headless=True,
+                                     tag=f"tg_{cc['number'][-4:]}")
+            except Exception as e:
+                import traceback as _tb
+                _tb_text = _tb.format_exc()
+                msg = str(e)
+                if ("TargetClosedError" in type(e).__name__ or "context or browser closed" in msg
+                        or "Executable doesn't exist" in msg):
+                    try:
+                        libs = W.chromium_missing_libs()
+                        if libs:
+                            _tb_text += "\n\nCHROMIUM LIB CHECK:\n" + libs
+                    except Exception:
+                        pass
+                print("WORKER ERROR:", _tb_text, flush=True)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": _tb_text,
+                       "screenshot": None, "proxy": (px or {}).get("server")}
+            if not load_failed(res):
+                break
+            print(f"card …{cc['number'][-4:]}: load failed on "
+                  f"{(px or {}).get('server')}, trying next proxy", flush=True)
+        return cc, res
 
     results = []
     lines = []
-
     refresh(lines, 0)
-    # one browser at a time (sequential) — stable on small containers,
-    # each result shown live as it completes; per-card watchdog so a hang
-    # can't freeze the rest of the run.
-    ex = ThreadPoolExecutor(max_workers=1)
-    npx = len(proxy_list)
-    for i, cc in enumerate(target, 1):
+
+    # process `workers` cards at once (parallel browsers). Keep the pool full:
+    # as soon as one card completes we launch the next, so 2+ cards are always
+    # being checked simultaneously. Watchdog bounds a total freeze.
+    ex = ThreadPoolExecutor(max_workers=workers)
+    npx = len(proxy_list) or 1
+    inflight = {}   # future -> card
+    card_i = 0
+    done = 0
+    WATCHDOG = 150
+
+    def launch_next():
+        nonlocal card_i
+        if card_i < n:
+            cc = target[card_i]
+            inflight[ex.submit(process_card, cc, card_i % npx)] = cc
+            card_i += 1
+
+    while len(inflight) < workers and card_i < n:
+        launch_next()
+
+    while inflight:
         if ABORT.get(chat_id):
-            print(f"ABORT: stopping at {i}/{n}", flush=True)
+            print(f"ABORT: stopping after {done}/{n}", flush=True)
+            for f in list(inflight):
+                f.cancel()
             break
-        refresh(lines, i - 1, current=cc["number"][-4:])
-        # Rotate on load-failure (page never loaded -> no charge): try the next
-        # proxy. Never retry after a submit/declined/unclear result.
-        start = (i - 1) % npx
-        res = None
-        for k in range(npx):
-            px = proxy_list[(start + k) % npx]
-            fut = ex.submit(run_one, cc, px)
+        done_futs, not_done = wait(list(inflight), timeout=WATCHDOG,
+                                   return_when=FIRST_COMPLETED)
+        if not done_futs:
+            # total freeze — fail the stuck cards so the run can't hang forever
+            for fut in not_done:
+                cc = inflight.pop(fut)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": "watchdog timeout",
+                       "screenshot": None, "proxy": ""}
+                print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
+                done += 1
+                record_result(chat_id, cc, res)
+                send_result(chat_id, res)
+                results.append((cc, res))
+                lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
+                             f"{res['status'].upper()}")
+                refresh(lines, done)
+                launch_next()
+            continue
+        for fut in done_futs:
+            cc = inflight.pop(fut)
             try:
-                res = fut.result(timeout=150)
+                cc, res = fut.result()
             except Exception as e:
                 res = {"cc": cc["number"], "last4": cc["number"][-4:],
-                       "status": "error", "response": f"watchdog timeout: {e}",
-                       "screenshot": None, "proxy": px["server"]}
-                print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
-            if not load_failed(res):
-                break
-            print(f"card …{cc['number'][-4:]}: load failed on {px['server']}, "
-                  f"trying next proxy", flush=True)
-        ABORT.pop(chat_id, None)
-        record_result(chat_id, cc, res)
-        send_result(chat_id, res)
-        results.append((cc, res))
-        lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
-                     f"{res['status'].upper()}")
-        refresh(lines, i)
+                       "status": "error", "response": f"worker crash: {e}",
+                       "screenshot": None, "proxy": ""}
+            done += 1
+            record_result(chat_id, cc, res)
+            send_result(chat_id, res)
+            results.append((cc, res))
+            lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
+                         f"{res['status'].upper()}")
+            refresh(lines, done)
+            launch_next()
     ex.shutdown(wait=False)
     ABORT.pop(chat_id, None)
 

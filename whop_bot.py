@@ -18,6 +18,7 @@ import string
 import tempfile
 import subprocess
 import glob
+import threading
 from playwright.sync_api import sync_playwright
 
 CHECKOUT_URL = "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
@@ -226,16 +227,22 @@ def load_pool():
     return pool
 
 
+# Guards the read-modify-write of the shared address pool so concurrent cards
+# (parallel workers) can't pick the SAME address or corrupt addresses.json.
+_ADDR_LOCK = threading.Lock()
+
+
 def get_new_address():
-    pool = load_pool()
-    avail = [a for i, a in enumerate(pool["addresses"]) if i not in pool["used"]]
-    if not avail:  # all used -> regenerate a fresh 50
-        pool = {"used": [], "addresses": [gen_address() for _ in range(POOL_SIZE)]}
-        avail = pool["addresses"]
-    addr = random.choice(avail)
-    idx = pool["addresses"].index(addr)
-    pool["used"].append(idx)
-    _write_pool(pool)
+    with _ADDR_LOCK:
+        pool = load_pool()
+        avail = [a for i, a in enumerate(pool["addresses"]) if i not in pool["used"]]
+        if not avail:  # all used -> regenerate a fresh 50
+            pool = {"used": [], "addresses": [gen_address() for _ in range(POOL_SIZE)]}
+            avail = pool["addresses"]
+        addr = random.choice(avail)
+        idx = pool["addresses"].index(addr)
+        pool["used"].append(idx)
+        _write_pool(pool)
     return addr
 
 
