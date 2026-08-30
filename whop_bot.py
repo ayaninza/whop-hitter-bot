@@ -972,22 +972,6 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
             resp = ""
         shot = f"{tag}_{last4}.png"
         page.screenshot(path=shot, full_page=True)
-        # After a successful charge Whop redirects to the community dashboard
-        # ("Home / Tools access / Discord access") with NO checkout form. That
-        # page has none of the success keywords, so it was misread as "Unclear
-        # result" on a genuine success. Detect it: if we've navigated off the
-        # checkout form (no email/line1/postal_code/zip inputs) and saw no
-        # decline signal, the charge succeeded.
-        try:
-            left_checkout = page.evaluate("""() => {
-                const onForm = !!(document.querySelector('input[name="email"]') ||
-                    document.querySelector('input[name="line1"]') ||
-                    document.querySelector('input[name="postal_code"]') ||
-                    document.querySelector('input[name="zip"]'));
-                return !onForm;
-            }""")
-        except Exception:
-            left_checkout = False
         browser.close()
 
     low = resp.lower()
@@ -1017,11 +1001,29 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         ("verify", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
+        # Card itself rejected / details invalid -> NEVER success.
+        ("incomplete or invalid", "declined", "Payment details invalid"),
+        ("card details are", "declined", "Payment details invalid"),
+        ("card information", "declined", "Invalid card details"),
+        ("invalid card", "declined", "Invalid card details"),
+        ("card is invalid", "declined", "Invalid card details"),
+        ("card number is invalid", "declined", "Invalid card number"),
+        ("not a valid card", "declined", "Invalid card number"),
+        ("enter a valid card", "declined", "Invalid card number"),
+        ("payment details invalid", "declined", "Payment details invalid"),
     ]
+    # Approve ONLY on a positive success signal. A genuine purchase lands on the
+    # product access/community dashboard (nav: "Tools access", "Discord access",
+    # "Announcements"); that's a strong success marker. We never enable the
+    # error-prone "no checkout inputs -> success" shortcut, because the checkout
+    # form is rendered in a modal/iframe where the top DOM shows no inputs even
+    # when the card is REJECTED (that caused false "Payment Approved").
     success_kw = ["payment successful", "payment was successful",
                   "you now have access", "access granted", "order confirmed",
                   "purchase complete", "thank you for your payment",
-                  "subscription is active", "your subscription", "welcome to"]
+                  "subscription is active", "your subscription", "welcome to",
+                  "tools access", "discord access", "announcements",
+                  "you're all set", "you're in", "active now"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:
@@ -1030,10 +1032,6 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
     if not status:
         if any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
-        elif left_checkout:
-            # No decline text and we left the checkout form (redirected to the
-            # access/community page) -> the charge actually went through.
-            status, reason = "success", "Payment approved (left checkout / access page)"
         else:
             status, reason = "error", "Unclear result (no clear success/error signal)"
 

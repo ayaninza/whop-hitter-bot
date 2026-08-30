@@ -254,13 +254,27 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("verify", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
+        # Card itself rejected / details invalid -> NEVER success.
+        ("incomplete or invalid", "declined", "Payment details invalid"),
+        ("card details are", "declined", "Payment details invalid"),
+        ("card information", "declined", "Invalid card details"),
+        ("invalid card", "declined", "Invalid card details"),
+        ("card is invalid", "declined", "Invalid card details"),
+        ("card number is invalid", "declined", "Invalid card number"),
+        ("not a valid card", "declined", "Invalid card number"),
+        ("enter a valid card", "declined", "Invalid card number"),
+        ("payment details invalid", "declined", "Payment details invalid"),
     ]
+    # Approve ONLY on a positive success signal (access/community dashboard nav
+    # or an explicit success phrase). NEVER the "no checkout inputs -> success"
+    # shortcut: the form is in a modal/iframe, so the top DOM shows no inputs
+    # even when the card is REJECTED (that caused false "Payment Approved").
     success_kw = ["payment successful", "payment was successful", "you now have access",
                   "access granted", "order confirmed", "purchase complete",
                   "thank you for your payment", "subscription is active",
                   "your subscription", "welcome to", "you're all set", "all set",
-                  "enjoy", "vip access", "you're in", "active now", "success",
-                  "receipt", "order #", "order number", "confirmed"]
+                  "enjoy", "vip access", "you're in", "active now",
+                  "tools access", "discord access", "announcements"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:
@@ -270,24 +284,7 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         if any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
         else:
-            # Heuristic: if we've navigated OFF the checkout/payment form and
-            # saw no decline text, the charge most likely succeeded. This
-            # prevents the "card got charged but reported Unclear" false
-            # negative that leads to dangerous re-runs.
-            try:
-                left_checkout = page.evaluate("""() => {
-                    const onForm = !!(document.querySelector('input[name="email"]') ||
-                        document.querySelector('input[name="line1"]') ||
-                        document.querySelector('input[name="postal_code"]') ||
-                        document.querySelector('input[name="zip"]'));
-                    return !onForm;
-                }""")
-            except Exception:
-                left_checkout = False
-            if left_checkout:
-                status, reason = "success", "Payment approved (left checkout page)"
-            else:
-                status, reason = "error", "Unclear result (no clear success/error signal)"
+            status, reason = "error", "Unclear result (no clear success/error signal)"
     print(f"[{tag}] DONE status={status}", flush=True)
     return {"cc": cc["number"], "last4": last4, "status": status,
             "response": reason, "screenshot": shot}
