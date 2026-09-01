@@ -265,6 +265,19 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("not a valid card number", "declined", "Invalid card number"),
         ("enter a valid card number", "declined", "Invalid card number"),
         ("payment details invalid", "declined", "Payment details invalid"),
+        # Whop "Confirm it's you" OTP gate blocks checkout BEFORE any charge —
+        # treat as error so we never report success, and retry fresh (new proxy
+        # + new email) to clear it.
+        ("confirm its you", "error", "Verification required (OTP/confirm-it's-you)"),
+        ("confirm it's you", "error", "Verification required (OTP/confirm-it's-you)"),
+        ("enter the code we sent", "error", "Verification required (OTP)"),
+        ("enter the code", "error", "Verification required (OTP)"),
+        ("we sent a code", "error", "Verification required (OTP)"),
+        ("to use your saved information", "error", "Verification required (OTP)"),
+        ("your saved information", "error", "Verification required (OTP)"),
+        ("logging in as", "error", "Verification required (OTP)"),
+        ("device will be remembered", "error", "Verification required (OTP)"),
+        ("verification code", "error", "Verification required (OTP)"),
     ]
     # Approve ONLY on a positive success signal (access/community dashboard nav
     # or an explicit success phrase). NEVER the "no checkout inputs -> success"
@@ -291,9 +304,10 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             "response": reason, "screenshot": shot}
 
 
-def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None):
+def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
+              email=None):
     addr = W.get_new_address()
-    email = W.random_email()
+    email = email or W.random_email()
     cc = cc_override if cc_override else W.CARD
     if tag is None:
         tag = f"ref_{cc['number'][-4:]}"

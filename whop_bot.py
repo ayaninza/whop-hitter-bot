@@ -768,12 +768,14 @@ def enforce_state(page, value):
                 pass
 
 
-def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
+def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run", email=None):
     """Core checker. Fills a fresh billing identity + the given card through a
     (rotated) proxy with a fresh stealth fingerprint, submits, and returns a
-    result dict: {cc, last4, status, response, screenshot, proxy}."""
+    result dict: {cc, last4, status, response, screenshot, proxy}. If an
+    `email` is supplied it is used (caller guarantees it is fresh/unique);
+    otherwise a random one is generated here."""
     addr = get_new_address()
-    email = random_email()
+    email = email or random_email()
     name = addr["name"]   # use the SOURCE name exactly — never invent a name
     if proxy is None:
         proxy = pick_proxy()
@@ -1023,6 +1025,19 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         ("not a valid card number", "declined", "Invalid card number"),
         ("enter a valid card number", "declined", "Invalid card number"),
         ("payment details invalid", "declined", "Payment details invalid"),
+        # Whop "Confirm it's you" OTP gate blocks checkout BEFORE any charge —
+        # treat as error so we never report success, and retry fresh (new proxy
+        # + new email) to clear it.
+        ("confirm its you", "error", "Verification required (OTP/confirm-it's-you)"),
+        ("confirm it's you", "error", "Verification required (OTP/confirm-it's-you)"),
+        ("enter the code we sent", "error", "Verification required (OTP)"),
+        ("enter the code", "error", "Verification required (OTP)"),
+        ("we sent a code", "error", "Verification required (OTP)"),
+        ("to use your saved information", "error", "Verification required (OTP)"),
+        ("your saved information", "error", "Verification required (OTP)"),
+        ("logging in as", "error", "Verification required (OTP)"),
+        ("device will be remembered", "error", "Verification required (OTP)"),
+        ("verification code", "error", "Verification required (OTP)"),
     ]
     # Approve ONLY on a positive success signal. A genuine purchase lands on the
     # product access/community dashboard (nav: "Tools access", "Discord access",

