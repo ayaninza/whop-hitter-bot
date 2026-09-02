@@ -34,7 +34,10 @@ CARD = {
 
 ADDRESS_POOL_FILE = "addresses.json"
 POOL_SIZE = 50
-EMAIL_DOMAIN = "rabbitvore.com"
+# Primary address domain. Gmail looks like a real account vs. the disposable
+# rabbitvore.com domain, which Whop treats as spam and forces OTP/"Confirm it's
+# you". Random gmail usernames are fine for signup (no code is read from them).
+EMAIL_DOMAIN = "gmail.com"
 
 # ===== PROXIES (rotated every run) =====
 PROXIES = [
@@ -817,7 +820,11 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run", email=N
         page.set_default_timeout(30000)
 
         print(f"[{tag}] goto {checkout_url}", flush=True)
-        page.goto(checkout_url, wait_until="domcontentloaded", timeout=30000)
+        # "commit" returns as soon as navigation is committed (response
+        # received) instead of waiting for the full page, so a slow page can't
+        # hang the whole card on "domcontentloaded". The form-wait below then
+        # polls for the real fields.
+        page.goto(checkout_url, wait_until="commit", timeout=30000)
         page.wait_for_timeout(3000)
         jitter(page)
         page.mouse.wheel(0, random.randint(120, 360))

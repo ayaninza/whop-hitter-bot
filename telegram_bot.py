@@ -423,13 +423,17 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     inflight = {}   # future -> card
     card_i = 0
     done = 0
-    WATCHDOG = 150
+    # A full checkout on a slow proxy can exceed 150s (goto 30s + form waits +
+    # up to ~75s settle + fills), so keep the watchdog generous: we only want to
+    # abandon a card that is genuinely stuck, not one that's merely slow.
+    WATCHDOG = int(os.environ.get("CHECK_WATCHDOG", "240"))
 
     def launch_next():
         nonlocal card_i
         if card_i < n:
             cc = target[card_i]
-            inflight[ex.submit(process_card, cc, card_i % npx)] = cc
+            px0 = proxy_list[card_i % npx]
+            inflight[ex.submit(process_card, cc, card_i % npx)] = (cc, px0)
             card_i += 1
 
     while len(inflight) < workers and card_i < n:
@@ -446,11 +450,12 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         if not done_futs:
             # total freeze — fail the stuck cards so the run can't hang forever
             for fut in not_done:
-                cc = inflight.pop(fut)
+                cc, px0 = inflight.pop(fut)
                 res = {"cc": cc["number"], "last4": cc["number"][-4:],
                        "status": "error", "response": "watchdog timeout",
-                       "screenshot": None, "proxy": ""}
-                print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
+                       "screenshot": None, "proxy": (px0 or {}).get("server", "")}
+                print(f"WATCHDOG: card …{cc['number'][-4:]} via "
+                      f"{(px0 or {}).get('server')} timed out", flush=True)
                 done += 1
                 record_result(chat_id, cc, res)
                 send_result(chat_id, res)
@@ -461,7 +466,7 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
                 launch_next()
             continue
         for fut in done_futs:
-            cc = inflight.pop(fut)
+            cc, _px0 = inflight.pop(fut)
             try:
                 cc, res = fut.result()
             except Exception as e:
