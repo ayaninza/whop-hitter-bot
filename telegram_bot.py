@@ -193,23 +193,55 @@ def load_failed(res):
     return any(m in r for m in markers)
 
 
-# process-wide set of emails already used, so we never re-submit one Whop may
-# have registered (that's what triggers the "Confirm it's you" OTP).
+# Email consumption: one real email per checkout try, removed from the list so
+# it's never reused (reusing a registered email is what triggers Whop's
+# "Confirm it's you" OTP). Invalid/malformed lines are dropped too.
+EMAIL_DB = os.environ.get("EMAIL_DB", "db.txt")
+_email_lock = threading.Lock()
+_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}$")
 _used_emails = set()
-_used_emails_lock = threading.Lock()
+
+
+def consume_email():
+    """Return the next unused email from EMAIL_DB (removing it + any invalid
+    lines from the file, thread-safe). Falls back to a fresh random email if
+    the file is missing/empty so the deployed bot still works."""
+    with _email_lock:
+        chosen = None
+        keep = []
+        try:
+            with open(EMAIL_DB, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [ln.strip() for ln in f]
+        except Exception:
+            lines = []
+        for ln in lines:
+            if not ln:
+                continue
+            if chosen is None and _EMAIL_RE.match(ln):
+                chosen = ln
+            else:
+                keep.append(ln)
+        if chosen is not None:
+            try:
+                with open(EMAIL_DB, "w", encoding="utf-8") as f:
+                    f.write("\n".join(keep) + ("\n" if keep else ""))
+            except Exception:
+                pass
+    if chosen:
+        return chosen
+    # file empty/missing -> random fallback (guaranteed unique in-process)
+    for _ in range(50):
+        e = W.random_email()
+        if e not in _used_emails:
+            _used_emails.add(e)
+            return e
+    e = W.random_email()
+    _used_emails.add(e)
+    return e
 
 
 def fresh_email():
-    """Generate an email guaranteed not to have been used in this process."""
-    with _used_emails_lock:
-        for _ in range(50):
-            e = W.random_email()
-            if e not in _used_emails:
-                _used_emails.add(e)
-                return e
-        e = W.random_email()
-        _used_emails.add(e)
-        return e
+    return consume_email()
 
 
 def add_proxies_tested(chat_id, text):
