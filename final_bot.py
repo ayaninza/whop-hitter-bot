@@ -418,7 +418,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             "response": reason, "screenshot": shot}
 
 
-def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None):
+def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
+              checkout_url=None):
     addr = W.get_new_address()
     email = W.random_email()
     cc = cc_override if cc_override else W.CARD
@@ -426,6 +427,7 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         tag = f"ref_{cc['number'][-4:]}"
     if proxy is None:
         proxy = W.pick_proxy()
+    url = checkout_url or BUY_VIP_URL
     print(f"[{tag}] START card …{cc['number'][-4:]} via {proxy['server']}", flush=True)
 
     ua = random.choice(W.USER_AGENTS)
@@ -453,8 +455,8 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         page.add_init_script(stealth)
         page.set_default_timeout(30000)
 
-        print(f"[{tag}] goto {BUY_VIP_URL}", flush=True)
-        page.goto(BUY_VIP_URL, wait_until="domcontentloaded", timeout=30000)
+        print(f"[{tag}] goto {url}", flush=True)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
         W.jitter(page)
         page.mouse.wheel(0, random.randint(120, 360))

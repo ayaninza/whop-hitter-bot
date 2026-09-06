@@ -31,6 +31,7 @@ _ah.CONNECT_TIMEOUT = 90
 
 import whop_bot as W
 import final_bot as F
+from final_bot import BUY_VIP_URL
 
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
@@ -379,6 +380,8 @@ def run_ref_flow(chat_id, ccs, proxy_list):
     """Run the buy-vip checkout flow (final_bot) for each card, sequentially,
     sending a result + screenshot to the chat as each finishes."""
     n = len(ccs)
+    db = get_db()
+    checkout_url = db["settings"].get("checkout_url", BUY_VIP_URL)
     icon = {"success": "✅", "insufficient": "⚠️", "declined": "⛔",
             "missing": "❓", "error": "💥"}
     kb_stop = types.InlineKeyboardMarkup()
@@ -419,7 +422,8 @@ def run_ref_flow(chat_id, ccs, proxy_list):
         px = proxy_list[(i - 1) % len(proxy_list)] if proxy_list else None
         try:
             res = F.run_final(cc_override=cc, proxy=px, headless=True,
-                              submit=True, tag=f"ref_{cc['number'][-4:]}")
+                              submit=True, tag=f"ref_{cc['number'][-4:]}",
+                              checkout_url=checkout_url)
         except Exception as e:
             import traceback as _tb
             _tb_text = _tb.format_exc()
@@ -655,6 +659,12 @@ def cmd_whop(m):
 def cmd_ref(m):
     body = cmd_args(m)
     blines = body.splitlines()
+    # Extract URL if user pasted one (like /whop does)
+    url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
+    if url_line:
+        db = get_db()
+        db["settings"]["checkout_url"] = url_line
+        save_db()
     card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
     db = get_db()
     target = []
