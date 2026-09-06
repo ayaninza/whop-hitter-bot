@@ -51,31 +51,104 @@ def read_form_final(page):
 
 
 def click_get_access(page, tag="final"):
-    """Click the exact blue 'Get access' button the user specified:
-    <button ... data-accent-color="blue" class="...fui-Button...">Get access</button>
-    There are 3 buttons with that identical class (two are 0x0 clipped
-    duplicates); we must target the VISIBLE one, otherwise Playwright waits
-    forever on a hidden element. Falls back to any visible 'Get access'."""
-    base = 'button[data-accent-color="blue"]:has-text("Get access")'
+    """Click the entry button — varies by checkout: 'Get access', 'Join now', etc."""
+    for btn_text in ("Get access", "Join now", "Buy now", "Subscribe"):
+        try:
+            page.get_by_role("button", name=btn_text).first.click(
+                timeout=8000, delay=20)
+            print(f"[{tag}] clicked '{btn_text}'", flush=True)
+            return True
+        except Exception:
+            continue
+    # fallback: any blue accent button
     try:
-        loc = page.locator(base).filter(visible=True)
-        if loc.count() == 0:
-            loc = page.locator('button:has-text("Get access")').filter(visible=True)
-        page.wait_for_selector(base + ':visible', state="visible", timeout=20000)
-        loc.first.scroll_into_view_if_needed(timeout=5000)
-        loc.first.click(timeout=8000, delay=20)
-        print(f"[{tag}] clicked visible blue 'Get access' button", flush=True)
+        page.locator(
+            'button[data-accent-color="blue"]').first.click(timeout=5000, delay=20)
+        print(f"[{tag}] clicked blue accent button (fallback)", flush=True)
         return True
     except Exception as e:
-        print(f"[{tag}] visible selector failed ({e}); trying role fallback", flush=True)
-    try:
-        page.get_by_role("button", name="Get access").filter(visible=True).first.click(
-            timeout=8000, delay=20)
-        print(f"[{tag}] clicked 'Get access' (role fallback)", flush=True)
-        return True
-    except Exception as e:
-        print(f"[{tag}] Get access click failed: {e}", flush=True)
+        print(f"[{tag}] all button attempts failed: {e}", flush=True)
         return False
+
+
+def click_agree_checkboxes(page, tag="final"):
+    """Find and click any 'I agree' / terms / consent checkboxes on the page.
+    Whop checkouts sometimes gate the submit button behind a checkbox that
+    must be ticked. We search for checkbox inputs + their labels, and also
+    role=checkbox elements, matching text like 'agree', 'terms', 'consent',
+    'policy', 'conditions', 'acknowledge'. Returns count of boxes clicked."""
+    CHECKBOX_JS = """() => {
+        let clicked = 0;
+        const keywords = ['agree', 'terms', 'consent', 'policy', 'conditions',
+                          'acknowledge', 'acceptable use', 'refund', 'privacy'];
+        function textNear(el) {
+            // walk up to find the nearest text content (label, parent, sibling)
+            let node = el;
+            for (let i = 0; i < 5; i++) {
+                if (!node) break;
+                const txt = (node.innerText || node.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                node = node.parentElement;
+            }
+            // also check next/previous siblings
+            let sib = el.nextElementSibling;
+            for (let i = 0; i < 3 && sib; i++) {
+                const txt = (sib.innerText || sib.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                sib = sib.nextElementSibling;
+            }
+            return false;
+        }
+        // 1) <input type="checkbox"> near agree-text labels
+        for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+            if (cb.checked) continue;
+            if (textNear(cb)) {
+                cb.click();
+                clicked++;
+            }
+        }
+        // 2) role="checkbox" elements (custom React checkboxes)
+        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
+            const state = cb.getAttribute('aria-checked') || cb.getAttribute('data-state');
+            if (state === 'true' || state === 'checked') continue;
+            if (textNear(cb)) {
+                cb.click();
+                clicked++;
+            }
+        }
+        // 3) <label> elements that contain a checkbox and agree-text
+        for (const lbl of document.querySelectorAll('label')) {
+            const txt = (lbl.innerText || lbl.textContent || '').toLowerCase();
+            let match = false;
+            for (const kw of keywords) { if (txt.includes(kw)) { match = true; break; } }
+            if (!match) continue;
+            // find the checkbox inside or referenced by this label
+            const inner = lbl.querySelector('input[type="checkbox"], [role="checkbox"]');
+            if (inner) {
+                const state = inner.checked !== undefined ? inner.checked :
+                              (inner.getAttribute('aria-checked') || inner.getAttribute('data-state'));
+                if (state === true || state === 'true' || state === 'checked') continue;
+                inner.click();
+                clicked++;
+            } else {
+                // label itself might be the clickable toggle
+                const state = lbl.getAttribute('aria-checked') || lbl.getAttribute('data-state');
+                if (state === 'true' || state === 'checked') continue;
+                lbl.click();
+                clicked++;
+            }
+        }
+        return clicked;
+    }"""
+    try:
+        n = page.evaluate(CHECKBOX_JS)
+        if n:
+            print(f"[{tag}] clicked {n} agree checkbox(es)", flush=True)
+            page.wait_for_timeout(500)
+        return n
+    except Exception as e:
+        print(f"[{tag}] agree checkbox scan: {e}", flush=True)
+        return 0
 
 
 def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
@@ -142,7 +215,12 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                 "response": "Filled, no submit",
                 "screenshot": f"{tag}_{last4}_pre.png"}
 
-    for name_btn in ("Get access", "Pay", "Subscribe", "Confirm"):
+    # Click any "I agree" / terms / consent checkboxes before submitting.
+    # Some Whop checkouts gate the submit button behind a required checkbox.
+    click_agree_checkboxes(page, tag)
+    page.wait_for_timeout(300)
+
+    for name_btn in ("Get access", "Join now", "Pay", "Subscribe", "Confirm", "Finish payment"):
         try:
             page.get_by_role("button", name=name_btn).click(timeout=6000, delay=20)
             print(f"[{tag}] clicked submit ('{name_btn}')", flush=True)
@@ -260,7 +338,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                   "thank you for your payment", "subscription is active",
                   "your subscription", "welcome to", "you're all set", "all set",
                   "enjoy", "vip access", "you're in", "active now", "success",
-                  "receipt", "order #", "order number", "confirmed"]
+                  "receipt", "order #", "order number", "confirmed",
+                  "finish your payment", "finish payment", "verification step"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:

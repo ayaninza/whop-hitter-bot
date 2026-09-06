@@ -1,11 +1,4 @@
-# ignore runtime data + generated artifacts
-db.json
-db.json.tmp
-proxies_user.json
-addresses.json
+shopify_profile.json
 *.png
-bot_out.txt
-bot_err.txt
 __pycache__/
-*.pyc
-.env
+.opencode/

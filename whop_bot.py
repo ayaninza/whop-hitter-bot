@@ -761,6 +761,69 @@ def enforce_state(page, value):
                 pass
 
 
+def click_agree_checkboxes(page, tag="run"):
+    """Find and click any 'I agree' / terms / consent checkboxes on the page.
+    Whop checkouts sometimes gate the submit button behind a checkbox that
+    must be ticked. Returns count of boxes clicked."""
+    CHECKBOX_JS = """() => {
+        let clicked = 0;
+        const keywords = ['agree', 'terms', 'consent', 'policy', 'conditions',
+                          'acknowledge', 'acceptable use', 'refund', 'privacy'];
+        function textNear(el) {
+            let node = el;
+            for (let i = 0; i < 5; i++) {
+                if (!node) break;
+                const txt = (node.innerText || node.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                node = node.parentElement;
+            }
+            let sib = el.nextElementSibling;
+            for (let i = 0; i < 3 && sib; i++) {
+                const txt = (sib.innerText || sib.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                sib = sib.nextElementSibling;
+            }
+            return false;
+        }
+        for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+            if (cb.checked) continue;
+            if (textNear(cb)) { cb.click(); clicked++; }
+        }
+        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
+            const state = cb.getAttribute('aria-checked') || cb.getAttribute('data-state');
+            if (state === 'true' || state === 'checked') continue;
+            if (textNear(cb)) { cb.click(); clicked++; }
+        }
+        for (const lbl of document.querySelectorAll('label')) {
+            const txt = (lbl.innerText || lbl.textContent || '').toLowerCase();
+            let match = false;
+            for (const kw of keywords) { if (txt.includes(kw)) { match = true; break; } }
+            if (!match) continue;
+            const inner = lbl.querySelector('input[type="checkbox"], [role="checkbox"]');
+            if (inner) {
+                const state = inner.checked !== undefined ? inner.checked :
+                              (inner.getAttribute('aria-checked') || inner.getAttribute('data-state'));
+                if (state === true || state === 'true' || state === 'checked') continue;
+                inner.click(); clicked++;
+            } else {
+                const state = lbl.getAttribute('aria-checked') || lbl.getAttribute('data-state');
+                if (state === 'true' || state === 'checked') continue;
+                lbl.click(); clicked++;
+            }
+        }
+        return clicked;
+    }"""
+    try:
+        n = page.evaluate(CHECKBOX_JS)
+        if n:
+            print(f"[{tag}] clicked {n} agree checkbox(es)", flush=True)
+            page.wait_for_timeout(500)
+        return n
+    except Exception as e:
+        print(f"[{tag}] agree checkbox scan: {e}", flush=True)
+        return 0
+
+
 def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
     """Core checker. Fills a fresh billing identity + the given card through a
     (rotated) proxy with a fresh stealth fingerprint, submits, and returns a
@@ -913,6 +976,10 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         # Final enforce right before submit (redundant safety)
         enforce_state(page, addr["state"])
         page.wait_for_timeout(500)
+
+        # Click any "I agree" / terms / consent checkboxes before submitting.
+        click_agree_checkboxes(page, tag)
+        page.wait_for_timeout(300)
 
         try:
             page.get_by_role("button", name="Get access").click(timeout=8000, delay=20)
