@@ -901,28 +901,21 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
 
         # 2) fill each field — line1 uses autocomplete to trigger browser fill
         fill_all(page, "country", "US")
-        jitter(page)
         fill_all(page, "name", name)
-        jitter(page)
         fill_all(page, "line1", addr["line1"])
-        page.wait_for_timeout(2000)  # wait for autocomplete to fill city/state/zip
+        page.wait_for_timeout(800)  # brief wait for autocomplete to fill city/state/zip
 
         # Read what autocomplete filled, only fill gaps
         form = read_form(page)
         if not _norm(form.get("city")):
             fill_all(page, "city", addr["city"])
-            jitter(page)
         if not _norm(form.get("zip")):
             fill_all(page, "zip", addr["zip"])
-            jitter(page)
         if not _norm(form.get("state")):
             fill_all(page, "state", addr["state"])
             enforce_state(page, addr["state"])
-            jitter(page)
         fill_all(page, "email", email)
-        jitter(page)
         fill_card(page, cc)
-        jitter(page)
 
         # Enforce state again after card fill (React may have re-rendered)
         enforce_state(page, addr["state"])
@@ -941,7 +934,7 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
             if not _norm(form.get("state")):
                 fill_all(page, "state", addr["state"])
                 enforce_state(page, addr["state"])
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(400)
             if not _norm(form.get("line1")):
                 fill_all(page, "line1", addr["line1"])
             if not _norm(form.get("city")):
@@ -950,7 +943,7 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
                 fill_all(page, "zip", addr["zip"])
             if not _norm(form.get("name")):
                 fill_all(page, "name", name)
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(300)
         print(f"[{tag}] VALIDATION FORM = {form}", flush=True)
         if form_errors:
             diag = page.evaluate("""() => {
@@ -975,11 +968,11 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
 
         # Final enforce right before submit (redundant safety)
         enforce_state(page, addr["state"])
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(200)
 
         # Click any "I agree" / terms / consent checkboxes before submitting.
         click_agree_checkboxes(page, tag)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(150)
 
         try:
             page.get_by_role("button", name="Get access").click(timeout=8000, delay=20)
@@ -1010,8 +1003,11 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
                 'purchase complete','thank you for your payment','subscription is active','your subscription',
                 'welcome to','insufficient','declined',"couldn't be processed",'could not be processed',
                 'try a different','do not honor','expired','invalid address','enter a valid address',
-                'invalid zip','missing field','required field','this field is required','verify',
-                'payment could not','card could not','error'];
+                'invalid zip','missing field','required field','this field is required',
+                'payment could not','card could not','error',
+                '3ds','3d secure','additional verification','redirected to your bank',
+                'text message to confirm','complete the verification','finish your payment',
+                'finish payment','verification step'];
             for (const s of sig) if (body.includes(s)) return true;
             if (/confirm|success|access|thank/i.test(location.href)) return true;
             return false;
@@ -1065,21 +1061,30 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         ("missing field", "missing", "Missing required fields"),
         ("required field", "missing", "Missing required fields"),
         ("this field is required", "missing", "Missing required fields"),
-        ("verify", "error", "Verification failed"),
+        ("verification failed", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
     ]
     success_kw = ["payment successful", "payment was successful",
                   "you now have access", "access granted", "order confirmed",
                   "purchase complete", "thank you for your payment",
-                  "subscription is active", "your subscription", "welcome to"]
+                  "subscription is active", "your subscription", "welcome to",
+                  "finish your payment", "finish payment", "verification step",
+                  "additional verification", "3ds", "3d secure",
+                  "redirected to your bank", "text message to confirm",
+                  "complete the verification"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:
             status, reason = st, rs
             break
     if not status:
-        if any(k in low for k in success_kw):
+        # Check for 3DS verification first (distinct from plain success)
+        if any(k in low for k in ("additional verification", "3ds", "3d secure",
+                                    "redirected to your bank", "text message to confirm",
+                                    "complete the verification")):
+            status, reason = "3ds", "3DS verification required"
+        elif any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
         else:
             status, reason = "error", "Unclear result (no clear success/error signal)"

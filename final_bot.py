@@ -152,83 +152,118 @@ def click_agree_checkboxes(page, tag="final"):
 
 
 def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
-    """Run the checkout fill on an already-loaded checkout page."""
+    """TURBO fill: wait for full form, one JS batch, direct card fill."""
     name = addr["name"]
     last4 = cc["number"][-4:]
+    state_val = addr["state"]
+    abbr, full = W._resolve_state(state_val)
 
-    W.fill_all(page, "country", "US")
-    W.jitter(page)
-    W.fill_all(page, "name", name)
-    W.jitter(page)
-    W.fill_all(page, "line1", addr["line1"])
-    page.wait_for_timeout(2000)  # wait for autocomplete to fill city/state/zip
-
-    form = W.read_form(page)
-    if not W._norm(form.get("city")):
-        W.fill_all(page, "city", addr["city"]); W.jitter(page)
-    if not W._norm(form.get("zip")):
-        W.fill_all(page, "zip", addr["zip"]); W.jitter(page)
-    if not W._norm(form.get("state")):
-        W.fill_all(page, "state", addr["state"])
-        W.enforce_state(page, addr["state"]); W.jitter(page)
-    W.fill_all(page, "email", email)
-    W.jitter(page)
-    W.fill_card(page, cc)
-    W.jitter(page)
-    W.enforce_state(page, addr["state"])
-
-    # Corrective loop
-    form, form_errors = {}, ["force"]
-    for attempt in range(4):
-        form = read_form_final(page)
-        form_errors = W.validate_form(form)
-        if not form_errors:
+    # ---- STEP 0: Wait for billing fields to ACTUALLY exist ----
+    # Email renders first; billing fields render ~1-2s later. We poll until
+    # BOTH name AND line1 exist so the batch JS doesn't hit empty DOMs.
+    for _ in range(40):  # up to 8s
+        ready = page.evaluate("""() => {
+            return !!document.querySelector('input[name="name"]')
+                && !!document.querySelector('input[name="line1"]');
+        }""")
+        if ready:
             break
-        print(f"[{tag}] retry {attempt}: {form_errors}", flush=True)
-        if not W._norm(form.get("state")):
-            W.fill_all(page, "state", addr["state"])
-            W.enforce_state(page, addr["state"]); page.wait_for_timeout(1500)
-        if not W._norm(form.get("line1")):
-            W.fill_all(page, "line1", addr["line1"])
-        if not W._norm(form.get("city")):
-            W.fill_all(page, "city", addr["city"])
-        if not W._norm(form.get("zip")):
-            W.fill_all(page, "zip", addr["zip"])
-        if not W._norm(form.get("name")):
-            W.fill_all(page, "name", name)
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(200)
 
-    print(f"[{tag}] VALIDATION FORM = {form}", flush=True)
-    if form_errors:
-        page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-        return {"cc": cc["number"], "last4": last4, "status": "missing",
-                "response": "Validation failed: " + "; ".join(form_errors),
-                "screenshot": f"{tag}_{last4}.png"}
+    # ---- STEP 1: ONE JS call fills ALL text inputs at once ----
+    page.evaluate("""(d) => {
+        const setter = (node, val) => {
+            const proto = Object.getPrototypeOf(node);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(node, val);
+            else node.value = val;
+            node.dispatchEvent(new Event('input', {bubbles:true}));
+            node.dispatchEvent(new Event('change', {bubbles:true}));
+        };
+        const fill = (sel, val) => {
+            document.querySelectorAll(sel).forEach(n => setter(n, val));
+        };
+        fill('input[name="name"]', d.name);
+        fill('input[autocomplete="name"]', d.name);
+        fill('input[name="cardName"]', d.name);
+        fill('input[name="line1"]', d.line1);
+        fill('input[name="city"]', d.city);
+        fill('input[name="zip"]', d.zip);
+        fill('input[name="postal_code"]', d.zip);
+        fill('input[name="email"]', d.email);
+        fill('select[name="country"]', d.country);
+    }""", {"name": name, "line1": addr["line1"], "city": addr["city"],
+            "zip": addr["zip"], "email": email, "country": "US"})
+    page.wait_for_timeout(200)  # let React re-render after batch fill
 
-    page.screenshot(path=f"{tag}_{last4}_pre.png", full_page=True)
-    W.enforce_state(page, addr["state"])
-    page.wait_for_timeout(500)
+    # ---- STEP 2: State select (native select_option, fire onChange) ----
+    for el in page.locator('select[name="state"]').all():
+        try:
+            el.select_option(value=abbr, timeout=1500)
+        except Exception:
+            try:
+                el.select_option(label=full, timeout=1500)
+            except Exception:
+                pass
 
-    if not submit:
-        print(f"[{tag}] DRY MODE — not submitting", flush=True)
-        return {"cc": cc["number"], "last4": last4, "status": "dry",
-                "response": "Filled, no submit",
-                "screenshot": f"{tag}_{last4}_pre.png"}
+    # ---- STEP 3: Wait for card iframes, then fill ----
+    for kw, val in [("card-number", cc["number"]),
+                    ("card-expiration", f"{cc['exp_month']} / {cc['exp_year'][2:]}"),
+                    ("card-verification", cc["cvc"])]:
+        filled = False
+        for _ in range(20):  # up to 4s per frame
+            for f in page.frames:
+                if kw in f.url:
+                    try:
+                        f.fill('input', val, timeout=2000)
+                        print(f"[ok] {kw}", flush=True)
+                        filled = True
+                    except Exception:
+                        pass
+                    break
+            if filled:
+                break
+            page.wait_for_timeout(200)
+        if not filled:
+            print(f"[skip] {kw}: frame not found", flush=True)
 
-    # Click any "I agree" / terms / consent checkboxes before submitting.
-    # Some Whop checkouts gate the submit button behind a required checkbox.
-    click_agree_checkboxes(page, tag)
-    page.wait_for_timeout(300)
+    # ---- STEP 4: Click agree checkbox (single JS) ----
+    page.evaluate("""() => {
+        const kw = ['agree','terms','consent','policy','conditions'];
+        const textNear = (el) => {
+            let n = el;
+            for (let i = 0; i < 5; i++) {
+                if (!n) break;
+                const t = (n.innerText||n.textContent||'').toLowerCase();
+                for (const k of kw) if (t.includes(k)) return true;
+                n = n.parentElement;
+            }
+            return false;
+        };
+        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            if (!cb.checked && textNear(cb)) cb.click();
+        });
+        document.querySelectorAll('[role="checkbox"]').forEach(cb => {
+            const s = cb.getAttribute('aria-checked')||cb.getAttribute('data-state');
+            if (s!=='true'&&s!=='checked' && textNear(cb)) cb.click();
+        });
+    }""")
 
+    # ---- STEP 5: Submit button ----
     for name_btn in ("Get access", "Join now", "Pay", "Subscribe", "Confirm", "Finish payment"):
         try:
-            page.get_by_role("button", name=name_btn).click(timeout=6000, delay=20)
+            page.get_by_role("button", name=name_btn).click(timeout=2000, delay=5)
             print(f"[{tag}] clicked submit ('{name_btn}')", flush=True)
             break
         except Exception:
             continue
 
-    # Wait for the submission to ACTUALLY finish (don't read while Processing…)
+    if not submit:
+        print(f"[{tag}] DRY MODE — not submitting", flush=True)
+        return {"cc": cc["number"], "last4": last4, "status": "dry",
+                "response": "Filled, no submit", "screenshot": ""}
+
+    # ---- STEP 6: Wait for result ----
     INFLIGHT_JS = """() => {
         const body = (document.body && document.body.innerText || '').toLowerCase();
         if (/processing|please wait|submitting|loading|\\.\\.\\./i.test(body)) return true;
@@ -247,14 +282,17 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             'purchase complete','thank you for your payment','subscription is active','your subscription',
             'welcome to','insufficient','declined',"couldn't be processed",'could not be processed',
             'try a different','do not honor','expired','invalid address','enter a valid address',
-            'invalid zip','missing field','required field','this field is required','verify',
-            'payment could not','card could not','error'];
+            'invalid zip','missing field','required field','this field is required',
+            'payment could not','card could not','error',
+            '3ds','3d secure','additional verification','redirected to your bank',
+            'text message to confirm','complete the verification','finish your payment',
+            'finish payment','verification step'];
         for (const s of sig) if (body.includes(s)) return true;
         if (/confirm|success|access|thank/i.test(location.href)) return true;
         return false;
     }"""
     seen_loading = False
-    for _ in range(50):
+    for _ in range(40):
         try:
             if page.evaluate(RESULT_JS):
                 break
@@ -262,11 +300,11 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             if in_flight:
                 seen_loading = True
             elif seen_loading:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(800)
                 break
         except Exception:
             pass
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(800)
 
     print(f"[{tag}] settled, reading result", flush=True)
     try:
@@ -329,7 +367,7 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("missing field", "missing", "Missing required fields"),
         ("required field", "missing", "Missing required fields"),
         ("this field is required", "missing", "Missing required fields"),
-        ("verify", "error", "Verification failed"),
+        ("verification failed", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
     ]
@@ -339,14 +377,22 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                   "your subscription", "welcome to", "you're all set", "all set",
                   "enjoy", "vip access", "you're in", "active now", "success",
                   "receipt", "order #", "order number", "confirmed",
-                  "finish your payment", "finish payment", "verification step"]
+                  "finish your payment", "finish payment", "verification step",
+                  "additional verification", "3ds", "3d secure",
+                  "redirected to your bank", "text message to confirm",
+                  "complete the verification"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:
             status, reason = st, rs
             break
     if not status:
-        if any(k in low for k in success_kw):
+        # Check for 3DS verification first (distinct from plain success)
+        if any(k in low for k in ("additional verification", "3ds", "3d secure",
+                                    "redirected to your bank", "text message to confirm",
+                                    "complete the verification")):
+            status, reason = "3ds", "3DS verification required"
+        elif any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
         else:
             # Heuristic: if we've navigated OFF the checkout/payment form and
