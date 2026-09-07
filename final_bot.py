@@ -455,9 +455,10 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
 
 
 def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
-              checkout_url=None):
+              checkout_url=None, email=None):
     addr = W.get_new_address()
-    email = W.random_email()
+    if not email:
+        email = W.random_email()
     cc = cc_override if cc_override else W.CARD
     if tag is None:
         tag = f"ref_{cc['number'][-4:]}"
