@@ -533,6 +533,8 @@ def run_ref_flow(chat_id, ccs, proxy_list):
     """Run the buy-vip checkout flow (final_bot) for each card, sequentially,
     sending a result + screenshot to the chat as each finishes."""
     n = len(ccs)
+    udb = user_db(chat_id)
+    checkout_url = udb["settings"].get("checkout_url")
     icon = {"success": "✅", "insufficient": "⚠️", "declined": "⛔",
             "missing": "❓", "error": "💥"}
     kb_stop = types.InlineKeyboardMarkup()
@@ -584,7 +586,7 @@ def run_ref_flow(chat_id, ccs, proxy_list):
                 with BROWSER_SEM:
                     res = F.run_final(cc_override=cc, proxy=px, headless=True,
                                       submit=True, tag=f"ref_{cc['number'][-4:]}",
-                                      email=em, checkout_url=udb["settings"].get("checkout_url"))
+                                      email=em, checkout_url=checkout_url)
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
