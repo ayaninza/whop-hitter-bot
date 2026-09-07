@@ -828,10 +828,10 @@ def cmd_whop(m):
 def cmd_ref(m):
     body = cmd_args(m)
     blines = body.splitlines()
+    udb = user_db(m.chat.id)
     # Extract URL if user pasted one (like /whop does)
     url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
     if url_line:
-        udb = user_db(m.chat.id)
         udb["settings"]["checkout_url"] = url_line
         save_db()
     card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
