@@ -453,59 +453,53 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         context.add_init_script(stealth)
         page = context.new_page()
         page.add_init_script(stealth)
-        page.set_default_timeout(30000)
+        page.set_default_timeout(15000)
 
         print(f"[{tag}] goto {url}", flush=True)
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
-        W.jitter(page)
-        page.mouse.wheel(0, random.randint(120, 360))
-        page.wait_for_timeout(int(W.human_pause(0.4, 1.0) * 1000))
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-        if not click_get_access(page, tag):
-            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-            browser.close()
-            return {"cc": cc["number"], "last4": last4, "status": "error",
-                    "response": "Could not click Get access",
-                    "screenshot": f"{tag}_{last4}.png"}
+        # Check if form is already visible (direct checkout URLs like /checkout/...)
+        form_visible = page.evaluate("""() => {
+            return !!(document.querySelector('input[name="email"]')
+                || document.querySelector('input[name="line1"]')
+                || document.querySelector('input[name="name"]'));
+        }""")
 
-        # Wait for the checkout form to mount. Navigation after the click can
-        # be slow through the proxy, so retry the click + wait once.
-        form_loaded = False
-        for attempt in range(3):
-            if attempt > 0:
-                print(f"[{tag}] retry Get access click (attempt {attempt})", flush=True)
-                click_get_access(page, tag)
-            try:
-                page.wait_for_selector(
-                    'input[name="line1"], input[name="name"], input[name="email"]',
-                    state="visible", timeout=30000)
-                form_loaded = True
-                break
-            except Exception:
+        if not form_visible:
+            # Product page — need to click entry button
+            clicked = click_get_access(page, tag)
+            if not clicked:
+                # Wait a bit and retry once
+                page.wait_for_timeout(1500)
+                clicked = click_get_access(page, tag)
+            if not clicked:
+                # Still no button? Maybe form loaded after JS render
                 page.wait_for_timeout(2000)
-        if not form_loaded:
-            print(f"[{tag}] CHECKOUT FORM NOT LOADED after Get access", flush=True)
-            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-            browser.close()
-            return {"cc": cc["number"], "last4": last4, "status": "error",
-                    "response": "Checkout form did not load after Get access",
-                    "screenshot": f"{tag}_{last4}.png"}
+                form_visible = page.evaluate("""() => {
+                    return !!(document.querySelector('input[name="email"]')
+                        || document.querySelector('input[name="line1"]'));
+                }""")
+                if not form_visible:
+                    page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
+                    browser.close()
+                    return {"cc": cc["number"], "last4": last4, "status": "error",
+                            "response": "Could not click entry button or find form",
+                            "screenshot": f"{tag}_{last4}.png"}
 
-        # Billing block (country / postal_code / state) mounts a moment AFTER
-        # the email/name/line1 fields. Wait, but don't hard-fail if slow —
-        # the corrective loop re-fills any gap.
-        try:
-            page.wait_for_selector(
-                'input[name="postal_code"], select[name="country"]',
-                state="visible", timeout=20000)
-        except Exception:
-            print(f"[{tag}] billing block slow; continuing (corrective loop will fill)", flush=True)
+        # Poll until billing fields exist (event-driven, not fixed wait)
+        for _ in range(30):
+            ready = page.evaluate("""() => {
+                return !!document.querySelector('input[name="name"]')
+                    && !!document.querySelector('input[name="line1"]');
+            }""")
+            if ready:
+                break
+            page.wait_for_timeout(300)
 
-        result = fill_and_submit(page, addr, email, cc, tag, submit)
-        result["proxy"] = (proxy or {}).get("server")
+        print(f"[{tag}] form ready, filling...", flush=True)
+        result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit)
         browser.close()
-        return result
+    return result
 
 
 def main():
