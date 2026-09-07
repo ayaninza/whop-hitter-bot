@@ -10,8 +10,6 @@ Playwright >= 1.40  |  pip install playwright && playwright install chromium
 Run: python whop_bot.py
 """
 
-import imaplib
-import email as email_lib
 import json
 import os
 import random
@@ -20,8 +18,6 @@ import string
 import tempfile
 import subprocess
 import glob
-import threading
-import time
 from playwright.sync_api import sync_playwright
 
 CHECKOUT_URL = "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
@@ -38,83 +34,6 @@ CARD = {
 ADDRESS_POOL_FILE = "addresses.json"
 POOL_SIZE = 50
 EMAIL_DOMAIN = "rabbitvore.com"
-
-# ===== IMAP OTP RETRIEVAL =====
-# Reads OTP codes from the catch-all @rabbitvore.com mailbox via IMAP.
-# The Project-email system routes ALL @rabbitvore.com mail to one inbox.
-IMAP_HOST = os.environ.get("CATCHALL_IMAP_HOST", "imap.gmail.com")
-IMAP_PORT = int(os.environ.get("CATCHALL_IMAP_PORT", "993"))
-IMAP_USER = os.environ.get("CATCHALL_IMAP_USER", "")
-IMAP_PASS = os.environ.get("CATCHALL_IMAP_PASS", "")
-OTP_POLL_INTERVAL = 3   # seconds between IMAP polls
-OTP_MAX_POLLS = 15      # max ~45s waiting for OTP
-
-
-def _otp_extract(text):
-    """Extract a 4-8 digit OTP code from email text using keyword context."""
-    if not text:
-        return None
-    otp_kw = re.compile(
-        r"(?:code|otp|pin|verification|confirm|verify|auth|passcode|one-time)",
-        re.IGNORECASE)
-    for m in re.finditer(r"\b\d{4,8}\b", text):
-        start = max(0, m.start() - 80)
-        end = min(len(text), m.end() + 80)
-        ctx = text[start:end]
-        if otp_kw.search(ctx):
-            return m.group()
-    m6 = re.search(r"\b\d{6}\b", text)
-    return m6.group() if m6 else None
-
-
-def fetch_otp_from_imap(target_email, sender_filter="whop.com", timeout_s=45):
-    """Poll the catch-all IMAP inbox for an OTP sent to target_email.
-    Returns the OTP string or None if not found within timeout."""
-    if not IMAP_USER or not IMAP_PASS:
-        print("[otp] IMAP credentials not configured — skipping OTP fetch", flush=True)
-        return None
-    print(f"[otp] polling IMAP for code sent to {target_email} …", flush=True)
-    deadline = time.time() + timeout_s
-    seen_uids = set()
-    while time.time() < deadline:
-        try:
-            conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-            conn.login(IMAP_USER, IMAP_PASS)
-            conn.select("INBOX")
-            # search for emails TO the target address
-            _, msg_nums = conn.search(None, f'TO "{target_email}"')
-            uids = msg_nums[0].split() if msg_nums[0] else []
-            for uid in reversed(uids):  # newest first
-                if uid in seen_uids:
-                    continue
-                seen_uids.add(uid)
-                _, data = conn.fetch(uid, "(RFC822)")
-                raw = data[0][1]
-                msg = email_lib.message_from_bytes(raw)
-                subj = msg.get("Subject", "")
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode(errors="ignore")
-                            break
-                else:
-                    body = msg.get_payload(decode=True).decode(errors="ignore")
-                # optionally filter by sender domain
-                from_addr = msg.get("From", "")
-                if sender_filter and sender_filter.lower() not in from_addr.lower():
-                    continue
-                otp = _otp_extract(subj + "\n" + body)
-                if otp:
-                    print(f"[otp] found code: {otp}", flush=True)
-                    conn.logout()
-                    return otp
-            conn.logout()
-        except Exception as e:
-            print(f"[otp] IMAP error: {e}", flush=True)
-        time.sleep(OTP_POLL_INTERVAL)
-    print("[otp] no code found within timeout", flush=True)
-    return None
 
 # ===== PROXIES (rotated every run) =====
 PROXIES = [
@@ -842,69 +761,6 @@ def enforce_state(page, value):
                 pass
 
 
-def click_agree_checkboxes(page, tag="run"):
-    """Find and click any 'I agree' / terms / consent checkboxes on the page.
-    Whop checkouts sometimes gate the submit button behind a checkbox that
-    must be ticked. Returns count of boxes clicked."""
-    CHECKBOX_JS = """() => {
-        let clicked = 0;
-        const keywords = ['agree', 'terms', 'consent', 'policy', 'conditions',
-                          'acknowledge', 'acceptable use', 'refund', 'privacy'];
-        function textNear(el) {
-            let node = el;
-            for (let i = 0; i < 5; i++) {
-                if (!node) break;
-                const txt = (node.innerText || node.textContent || '').toLowerCase();
-                for (const kw of keywords) { if (txt.includes(kw)) return true; }
-                node = node.parentElement;
-            }
-            let sib = el.nextElementSibling;
-            for (let i = 0; i < 3 && sib; i++) {
-                const txt = (sib.innerText || sib.textContent || '').toLowerCase();
-                for (const kw of keywords) { if (txt.includes(kw)) return true; }
-                sib = sib.nextElementSibling;
-            }
-            return false;
-        }
-        for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
-            if (cb.checked) continue;
-            if (textNear(cb)) { cb.click(); clicked++; }
-        }
-        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
-            const state = cb.getAttribute('aria-checked') || cb.getAttribute('data-state');
-            if (state === 'true' || state === 'checked') continue;
-            if (textNear(cb)) { cb.click(); clicked++; }
-        }
-        for (const lbl of document.querySelectorAll('label')) {
-            const txt = (lbl.innerText || lbl.textContent || '').toLowerCase();
-            let match = false;
-            for (const kw of keywords) { if (txt.includes(kw)) { match = true; break; } }
-            if (!match) continue;
-            const inner = lbl.querySelector('input[type="checkbox"], [role="checkbox"]');
-            if (inner) {
-                const state = inner.checked !== undefined ? inner.checked :
-                              (inner.getAttribute('aria-checked') || inner.getAttribute('data-state'));
-                if (state === true || state === 'true' || state === 'checked') continue;
-                inner.click(); clicked++;
-            } else {
-                const state = lbl.getAttribute('aria-checked') || lbl.getAttribute('data-state');
-                if (state === 'true' || state === 'checked') continue;
-                lbl.click(); clicked++;
-            }
-        }
-        return clicked;
-    }"""
-    try:
-        n = page.evaluate(CHECKBOX_JS)
-        if n:
-            print(f"[{tag}] clicked {n} agree checkbox(es)", flush=True)
-            page.wait_for_timeout(500)
-        return n
-    except Exception as e:
-        print(f"[{tag}] agree checkbox scan: {e}", flush=True)
-        return 0
-
-
 def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
     """Core checker. Fills a fresh billing identity + the given card through a
     (rotated) proxy with a fresh stealth fingerprint, submits, and returns a
@@ -1057,10 +913,6 @@ def run_checkout(checkout_url, cc, proxy=None, headless=True, tag="run"):
         # Final enforce right before submit (redundant safety)
         enforce_state(page, addr["state"])
         page.wait_for_timeout(500)
-
-        # Click any "I agree" / terms / consent checkboxes before submitting.
-        click_agree_checkboxes(page, tag)
-        page.wait_for_timeout(300)
 
         try:
             page.get_by_role("button", name="Get access").click(timeout=8000, delay=20)

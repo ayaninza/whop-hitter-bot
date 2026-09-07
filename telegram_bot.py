@@ -584,7 +584,7 @@ def run_ref_flow(chat_id, ccs, proxy_list):
                 with BROWSER_SEM:
                     res = F.run_final(cc_override=cc, proxy=px, headless=True,
                                       submit=True, tag=f"ref_{cc['number'][-4:]}",
-                                      email=em)
+                                      email=em, checkout_url=udb["settings"].get("checkout_url"))
             except Exception as e:
                 import traceback as _tb
                 _tb_text = _tb.format_exc()
@@ -828,6 +828,12 @@ def cmd_whop(m):
 def cmd_ref(m):
     body = cmd_args(m)
     blines = body.splitlines()
+    # Extract URL if user pasted one (like /whop does)
+    url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
+    if url_line:
+        udb = user_db(m.chat.id)
+        udb["settings"]["checkout_url"] = url_line
+        save_db()
     card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
     udb = user_db(m.chat.id)
     target = []
