@@ -158,13 +158,15 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
     state_val = addr["state"]
     abbr, full = W._resolve_state(state_val)
 
-    # ---- STEP 0: Wait for billing fields to ACTUALLY exist ----
-    # Email renders first; billing fields render ~1-2s later. We poll until
-    # BOTH name AND line1 exist so the batch JS doesn't hit empty DOMs.
-    for _ in range(40):  # up to 8s
+    # ---- STEP 0: Wait for form to be ready ----
+    # Check for ANY billing-related input as a signal the form mounted.
+    for _ in range(20):  # up to 4s
         ready = page.evaluate("""() => {
-            return !!document.querySelector('input[name="name"]')
-                && !!document.querySelector('input[name="line1"]');
+            return !!(document.querySelector('input[name="email"]')
+                || document.querySelector('input[name="name"]')
+                || document.querySelector('input[name="line1"]')
+                || document.querySelector('input[autocomplete="name"]')
+                || document.querySelector('input[name="cardName"]'));
         }""")
         if ready:
             break
@@ -523,15 +525,17 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
                             "response": "Could not click entry button or find form",
                             "screenshot": f"{tag}_{last4}.png"}
 
-        # Poll until billing fields exist (event-driven, not fixed wait)
-        for _ in range(30):
+        # Poll until form fields exist (event-driven, not fixed wait)
+        for _ in range(20):  # up to 4s
             ready = page.evaluate("""() => {
-                return !!document.querySelector('input[name="name"]')
-                    && !!document.querySelector('input[name="line1"]');
+                return !!(document.querySelector('input[name="email"]')
+                    || document.querySelector('input[name="name"]')
+                    || document.querySelector('input[name="line1"]')
+                    || document.querySelector('input[autocomplete="name"]'));
             }""")
             if ready:
                 break
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(200)
 
         print(f"[{tag}] form ready, filling...", flush=True)
         result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit)
