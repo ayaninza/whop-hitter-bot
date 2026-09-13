@@ -1,0 +1,109 @@
+{
+  "proxies_system": [
+    "208280:Jdp5rbuDkbCb@196.51.106.142:8800",
+    "208280:Jdp5rbuDkbCb@196.51.106.238:8800",
+    "208280:Jdp5rbuDkbCb@196.51.106.202:8800",
+    "208280:Jdp5rbuDkbCb@196.51.106.253:8800",
+    "208280:Jdp5rbuDkbCb@196.51.109.56:8800",
+    "208280:Jdp5rbuDkbCb@196.51.106.169:8800",
+    "208280:Jdp5rbuDkbCb@196.51.109.16:8800",
+    "208280:Jdp5rbuDkbCb@196.51.109.250:8800",
+    "208280:Jdp5rbuDkbCb@196.51.109.207:8800",
+    "208280:Jdp5rbuDkbCb@196.51.109.178:8800",
+    "nYKlUISwMzaKffj:qRV9x2Zi8aZc86v@82.29.116.237:48051"
+  ],
+  "users": {
+    "123456": {
+      "ccs": [],
+      "proxies_user": [],
+      "last_run": [
+        {
+          "raw": "x|y|z|w",
+          "status": "success",
+          "proxy": "http://h:1",
+          "response": "ok"
+        }
+      ],
+      "settings": {
+        "checkout_url": "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
+      }
+    },
+    "999999": {
+      "ccs": [],
+      "proxies_user": [
+        "user:pass@p105.instantproxies.com:9251"
+      ],
+      "last_run": [],
+      "settings": {
+        "checkout_url": "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
+      }
+    },
+    "12345": {
+      "ccs": [],
+      "proxies_user": [],
+      "last_run": [
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p2",
+          "email": "x@y.z",
+          "response": "ok"
+        },
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p1",
+          "email": "x@y.z",
+          "response": "ok"
+        },
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p1",
+          "email": "x@y.z",
+          "response": "ok"
+        },
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p2",
+          "email": "x@y.z",
+          "response": "ok"
+        }
+      ],
+      "settings": {
+        "checkout_url": "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
+      }
+    },
+    "1": {
+      "ccs": [],
+      "proxies_user": [],
+      "last_run": [
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p1",
+          "email": "kvz5qc16mpe@gmail.com",
+          "response": "ok"
+        },
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p2",
+          "email": "sdkk0rrlm6sm1@gmail.com",
+          "response": "ok"
+        },
+        {
+          "raw": "x",
+          "status": "success",
+          "proxy": "http://p1",
+          "email": "wd4obeqfp@gmail.com",
+          "response": "ok"
+        }
+      ],
+      "settings": {
+        "checkout_url": "https://whop.com/checkout/2onbgwXn2utmOapDAl-sTbB-xhGu-BQo9-ppzjRbOKz1Pc/"
+      }
+    }
+  }
+}

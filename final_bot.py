@@ -151,7 +151,13 @@ def click_agree_checkboxes(page, tag="final"):
         return 0
 
 
-def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
+def _stopped_res(cc, last4):
+    return {"cc": cc, "last4": last4, "status": "stopped",
+            "response": "Stopped by user", "screenshot": ""}
+
+
+def fill_and_submit(page, addr, email, cc, tag="final", submit=True,
+                    should_stop=None):
     """TURBO fill: wait for full form, one JS batch, direct card fill."""
     name = addr["name"]
     last4 = cc["number"][-4:]
@@ -184,6 +190,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         if state["billing"]:
             found_billing = True
             break
+        if should_stop and should_stop():
+            return _stopped_res(cc, last4)
         # Nudge: scroll so any lazy sections render; never click/focus.
         try:
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
@@ -196,6 +204,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                              "not found) - retry on fresh proxy"),
                 "screenshot": ""}
     page.wait_for_timeout(800)  # let React mount + settle before filling
+    if should_stop and should_stop():
+        return _stopped_res(cc, last4)
 
     # ---- STEP 1: ONE JS call fills ALL text inputs at once ----
     page.evaluate("""(d) => {
@@ -258,6 +268,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                     ("card-verification", cc["cvc"])]:
         filled = False
         for it in range(50):  # up to 10s per frame
+            if should_stop and should_stop():
+                return _stopped_res(cc, last4)
             for f in page.frames:
                 if kw in f.url:
                     try:
@@ -306,6 +318,8 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
     if submit and missing:
         # One last chance: some proxies just need more time for the iframes.
         for _ in range(50):  # up to 10s more
+            if should_stop and should_stop():
+                return _stopped_res(cc, last4)
             missing = [kw for kw in ("card-number", "card-expiration",
                                      "card-verification")
                        if not any(kw in f.url for f in page.frames)]
@@ -394,6 +408,9 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
     }"""
     seen_loading = False
     for _ in range(50):
+        if should_stop and should_stop():
+            print(f"[{tag}] STOP during result wait", flush=True)
+            return _stopped_res(cc["number"], last4)
         try:
             if page.evaluate(RESULT_JS):
                 break
@@ -482,12 +499,27 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         ("verification failed", "error", "Verification failed"),
         ("payment could not", "declined", "Card declined by issuer"),
         ("card could not", "declined", "Card declined by issuer"),
+        ("doesn't allow this type", "declined", "Card declined by issuer"),
+        ("does not allow this type", "declined", "Card declined by issuer"),
+        ("is not allowed", "declined", "Card declined by issuer"),
+        ("not allowed for this", "declined", "Card declined by issuer"),
+        ("cannot be used", "declined", "Card declined by issuer"),
+        ("can't be used", "declined", "Card declined by issuer"),
+        ("not accepted for this", "declined", "Card declined by issuer"),
+        ("was not accepted", "declined", "Card declined by issuer"),
+        ("not approved", "declined", "Card declined by issuer"),
+        ("payment method was declined", "declined", "Card declined by issuer"),
+        ("restricted", "declined", "Card declined by issuer"),
+        ("unavailable for this", "declined", "Card declined by issuer"),
+        ("not supported", "declined", "Card declined by issuer"),
+        ("try again", "error", "Payment failed, please retry"),
+        ("please try again", "error", "Payment failed, please retry"),
     ]
     success_kw = ["payment successful", "payment was successful", "you now have access",
                   "access granted", "order confirmed", "purchase complete",
                   "thank you for your payment", "subscription is active",
-                  "your subscription", "welcome to", "you're all set", "all set",
-                  "enjoy", "vip access", "you're in", "active now", "success",
+                  "your subscription", "you're all set",
+                  "vip access", "you're in", "active now", "success",
                   "receipt", "order #", "order number", "confirmed",
                   "finish your payment", "finish payment", "verification step",
                   "additional verification", "3ds", "3d secure",
@@ -507,36 +539,51 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         elif any(k in low for k in success_kw):
             status, reason = "success", "Payment approved"
         else:
-            # Heuristic: if we've navigated OFF the checkout/payment form and
-            # saw no decline text, the charge most likely succeeded. This
-            # prevents the "card got charged but reported Unclear" false
-            # negative that leads to dangerous re-runs.
+            # Heuristic: we've left the payment form. Require BOTH the form
+            # being gone AND a real approval signal before calling it
+            # "success" — otherwise a decline that re-renders the checkout
+            # (form removed, inline error shown) gets falsely saved as live.
             try:
-                left_checkout = page.evaluate("""() => {
-                    const onForm = !!(document.querySelector('input[name="email"]') ||
+                on_form = page.evaluate("""() => {
+                    return !!(document.querySelector('input[name="email"]') ||
                         document.querySelector('input[name="line1"]') ||
                         document.querySelector('input[name="postal_code"]') ||
                         document.querySelector('input[name="zip"]'));
-                    const btnDisabled = !!([...document.querySelectorAll('button, [role="button"]')]
+                }""")
+                btn_disabled = page.evaluate("""() => {
+                    return !!([...document.querySelectorAll('button, [role="button"]')]
                         .find(b => {
                             const t = (b.innerText || '').toLowerCase();
                             return /pay|submit|access|confirm|process/i.test(t) && b.disabled;
                         }));
-                    return !onForm || btnDisabled;
                 }""")
             except Exception:
-                left_checkout = False
-            if left_checkout:
+                on_form, btn_disabled = True, False
+            left_checkout = not on_form or btn_disabled
+            try:
+                url_low = page.url.lower()
+            except Exception:
+                url_low = ""
+            url_fail = any(k in url_low for k in
+                           ("declin", "fail", "error", "cancel", "denied", "refus"))
+            url_success = any(k in url_low for k in
+                              ("success", "receipt", "/order", "confirmation",
+                               "access-granted", "thanks", "thankyou", "complete"))
+            if url_fail:
+                status = "declined" if "declin" in url_low else "error"
+                reason = "Checkout declined by issuer"
+            elif left_checkout and (url_success or any(k in low for k in success_kw)):
                 status, reason = "success", "Payment approved (left checkout page)"
             else:
-                status, reason = "error", "Unclear result (no clear success/error signal)"
+                status, reason = ("error",
+                                  "Unclear result - charge NOT confirmed, not saved as working")
     print(f"[{tag}] DONE status={status}", flush=True)
     return {"cc": cc["number"], "last4": last4, "status": status,
             "response": reason, "screenshot": shot}
 
 
 def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
-              checkout_url=None, email=None, direct=False):
+              checkout_url=None, email=None, direct=False, should_stop=None):
     addr = W.get_new_address()
     if not email:
         email = W.random_email()
@@ -579,6 +626,9 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
         print(f"[{tag}] goto {url}", flush=True)
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(1500)  # let the page hydrate before interacting
+        if should_stop and should_stop():
+            browser.close()
+            return _stopped_res(cc["number"], last4)
 
         # Check if form is already visible (direct checkout URLs like /checkout/...)
         form_visible = page.evaluate("""() => {
@@ -615,6 +665,9 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
 
         # Poll until form fields exist (event-driven, not fixed wait)
         for _ in range(60):  # up to 12s
+            if should_stop and should_stop():
+                browser.close()
+                return _stopped_res(cc["number"], last4)
             ready = page.evaluate("""() => {
                 return !!(document.querySelector('input[name="email"]')
                     || document.querySelector('input[name="name"]')
@@ -626,7 +679,11 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
             page.wait_for_timeout(200)
 
         print(f"[{tag}] form ready, filling...", flush=True)
-        result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit)
+        result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit,
+                                 should_stop=should_stop)
+        if result.get("status") == "stopped":
+            browser.close()
+            return result
         browser.close()
     return result
 
