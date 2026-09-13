@@ -158,17 +158,44 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
     state_val = addr["state"]
     abbr, full = W._resolve_state(state_val)
 
-    # ---- STEP 0: Wait for billing fields to ACTUALLY exist ----
-    # Email renders first; billing fields render ~1-2s later. We poll until
-    # BOTH name AND line1 exist so the batch JS doesn't hit empty DOMs.
-    for _ in range(40):  # up to 8s
-        ready = page.evaluate("""() => {
-            return !!document.querySelector('input[name="name"]')
-                && !!document.querySelector('input[name="line1"]');
-        }""")
-        if ready:
+    # ---- STEP 0: Wait for the FULL form to mount + settle ----
+    # TURBO still needs to be correct: filling a half-mounted React form makes
+    # Whop re-draw the checkout as a blank page (observed repeatedly). So we
+    # wait until billing AND the payment section are present, let React settle,
+    # and only then fill. Scroll toward the form while polling to force lazy
+    # sections to render.
+    found_billing = False
+    for _ in range(60):  # up to 15s
+        try:
+            state = page.evaluate("""() => {
+                const has = (sel) => !!document.querySelector(sel);
+                const billing = (has('input[name="email"]'))
+                    && (has('input[name="name"]')
+                        || has('input[autocomplete="name"]')
+                        || has('input[name="cardName"]'))
+                    && (has('input[name="line1"]') || has('input[name="postal_code"]'));
+                const any_field = has('input[name="email"]')
+                    || has('input[name="name"]') || has('input[name="line1"]')
+                    || has('input[autocomplete="name"]');
+                return {billing: billing, any: any_field};
+            }""")
+        except Exception:
+            state = {"billing": False, "any": False}
+        if state["billing"]:
+            found_billing = True
             break
-        page.wait_for_timeout(200)
+        # Nudge: scroll so any lazy sections render; never click/focus.
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+    if not found_billing:
+        return {"cc": cc, "last4": last4, "status": "error",
+                "response": ("Could not load checkout form (billing fields "
+                             "not found) - retry on fresh proxy"),
+                "screenshot": ""}
+    page.wait_for_timeout(800)  # let React mount + settle before filling
 
     # ---- STEP 1: ONE JS call fills ALL text inputs at once ----
     page.evaluate("""(d) => {
@@ -207,15 +234,34 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                 pass
 
     # ---- STEP 3: Wait for card iframes, then fill ----
+    # The card fields are lazy-loaded: BasisTheory iframes only mount once the
+    # payment section is near the viewport. Re-scroll toward the card region
+    # while polling so the section is in view whenever it renders.
+    def _card_scroll():
+        try:
+            page.evaluate("""() => {
+                const hit = document.querySelector('iframe[src*="card-number"]');
+                if (hit) { hit.scrollIntoView({block:'center'}); return; }
+                window.scrollTo(0, document.body.scrollHeight);
+                for (const el of document.querySelectorAll('input,textarea,label')) {
+                    const t = (el.getAttribute('placeholder') || '').toLowerCase();
+                    if (t && /card|expiry|expiration|cvc|cvv/.test(t)) {
+                        el.scrollIntoView({block:'center'}); return;
+                    }
+                }
+            }""")
+        except Exception:
+            pass
+    _card_scroll()
     for kw, val in [("card-number", cc["number"]),
                     ("card-expiration", f"{cc['exp_month']} / {cc['exp_year'][2:]}"),
                     ("card-verification", cc["cvc"])]:
         filled = False
-        for _ in range(20):  # up to 4s per frame
+        for it in range(50):  # up to 10s per frame
             for f in page.frames:
                 if kw in f.url:
                     try:
-                        f.fill('input', val, timeout=2000)
+                        f.fill('input', val, timeout=3000)
                         print(f"[ok] {kw}", flush=True)
                         filled = True
                     except Exception:
@@ -223,9 +269,13 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                     break
             if filled:
                 break
+            if it % 4 == 0:
+                _card_scroll()  # keep payment section in view while it renders
             page.wait_for_timeout(200)
         if not filled:
             print(f"[skip] {kw}: frame not found", flush=True)
+    missing = [kw for kw in ("card-number", "card-expiration", "card-verification")
+               if not any(kw in f.url for f in page.frames)]
 
     # ---- STEP 4: Click agree checkbox (single JS) ----
     page.evaluate("""() => {
@@ -249,21 +299,68 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
         });
     }""")
 
-    # ---- STEP 5: Submit button ----
-    for name_btn in ("Get access", "Join now", "Pay", "Subscribe", "Confirm", "Finish payment"):
+    # ---- STEP 5: Card-field gate ----
+    # If BasisTheory card iframes never mounted (blocked/slow proxy), do NOT
+    # submit an empty card. Report a load-failure so the deploy bot retries
+    # this card on the next proxy (no charge has occurred yet).
+    if submit and missing:
+        # One last chance: some proxies just need more time for the iframes.
+        for _ in range(50):  # up to 10s more
+            missing = [kw for kw in ("card-number", "card-expiration",
+                                     "card-verification")
+                       if not any(kw in f.url for f in page.frames)]
+            if not missing:
+                for kw in ("card-number", "card-expiration", "card-verification"):
+                    for f in page.frames:
+                        if kw in f.url:
+                            try:
+                                val = {"card-number": cc["number"],
+                                       "card-expiration": f"{cc['exp_month']} / {cc['exp_year'][2:]}",
+                                       "card-verification": cc["cvc"]}[kw]
+                                f.fill('input', val, timeout=3000)
+                                print(f"[ok] {kw} (late)", flush=True)
+                            except Exception:
+                                pass
+                            break
+                break
+            page.wait_for_timeout(200)
+        if missing:
+            print(f"[{tag}] FAIL: card fields not mounted: {missing}", flush=True)
+            return {"cc": cc["number"], "last4": last4, "status": "error",
+                    "response": f"Could not load checkout form (card fields {missing} not found) - retry on fresh proxy",
+                    "screenshot": ""}
+
+    # ---- STEP 6: Submit button ----
+    clicked_submit = False
+    for name_btn in ("Pay", "Pay now", "Complete payment", "Process payment",
+                     "Submit payment", "Get access", "Join now", "Subscribe",
+                     "Confirm", "Finish payment", "Buy now"):
         try:
             page.get_by_role("button", name=name_btn).click(timeout=2000, delay=5)
             print(f"[{tag}] clicked submit ('{name_btn}')", flush=True)
+            clicked_submit = True
             break
         except Exception:
             continue
+    if not clicked_submit:
+        # Fallback: find any button that looks like a submit/pay button
+        page.evaluate("""() => {
+            const btns = [...document.querySelectorAll('button, [role="button"]')];
+            for (const b of btns) {
+                const t = (b.innerText || '').toLowerCase();
+                if (/pay|submit|access|join|confirm|process/i.test(t) && !b.disabled) {
+                    b.click(); break;
+                }
+            }
+        }""")
+        print(f"[{tag}] clicked submit (JS fallback)", flush=True)
 
     if not submit:
         print(f"[{tag}] DRY MODE — not submitting", flush=True)
         return {"cc": cc["number"], "last4": last4, "status": "dry",
                 "response": "Filled, no submit", "screenshot": ""}
 
-    # ---- STEP 6: Wait for result ----
+    # ---- STEP 7: Wait for result ----
     INFLIGHT_JS = """() => {
         const body = (document.body && document.body.innerText || '').toLowerCase();
         if (/processing|please wait|submitting|loading|\\.\\.\\./i.test(body)) return true;
@@ -286,13 +383,17 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             'payment could not','card could not','error',
             '3ds','3d secure','additional verification','redirected to your bank',
             'text message to confirm','complete the verification','finish your payment',
-            'finish payment','verification step'];
+            'finish payment','verification step',
+            'payment failed','card was declined','try again','invalid card',
+            'card number is invalid','incorrect cvv','cvc is invalid',
+            'billing postal code','zip code is invalid',
+            'something went wrong','an error occurred','please try again'];
         for (const s of sig) if (body.includes(s)) return true;
-        if (/confirm|success|access|thank/i.test(location.href)) return true;
+        if (/confirm|success|access|thank|receipt|order/i.test(location.href)) return true;
         return false;
     }"""
     seen_loading = False
-    for _ in range(40):
+    for _ in range(50):
         try:
             if page.evaluate(RESULT_JS):
                 break
@@ -300,11 +401,22 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
             if in_flight:
                 seen_loading = True
             elif seen_loading:
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(600)
                 break
+            # Also check if submit button became disabled (processing)
+            btn_disabled = page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button, [role="button"]')];
+                for (const b of btns) {
+                    const t = (b.innerText || '').toLowerCase();
+                    if (/pay|submit|access|confirm|process/i.test(t) && b.disabled) return true;
+                }
+                return false;
+            }""")
+            if btn_disabled and not seen_loading:
+                seen_loading = True
         except Exception:
             pass
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(600)
 
     print(f"[{tag}] settled, reading result", flush=True)
     try:
@@ -405,7 +517,12 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
                         document.querySelector('input[name="line1"]') ||
                         document.querySelector('input[name="postal_code"]') ||
                         document.querySelector('input[name="zip"]'));
-                    return !onForm;
+                    const btnDisabled = !!([...document.querySelectorAll('button, [role="button"]')]
+                        .find(b => {
+                            const t = (b.innerText || '').toLowerCase();
+                            return /pay|submit|access|confirm|process/i.test(t) && b.disabled;
+                        }));
+                    return !onForm || btnDisabled;
                 }""")
             except Exception:
                 left_checkout = False
@@ -419,16 +536,20 @@ def fill_and_submit(page, addr, email, cc, tag="final", submit=True):
 
 
 def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None,
-              checkout_url=None):
+              checkout_url=None, email=None, direct=False):
     addr = W.get_new_address()
-    email = W.random_email()
+    if not email:
+        email = W.random_email()
     cc = cc_override if cc_override else W.CARD
     if tag is None:
         tag = f"ref_{cc['number'][-4:]}"
-    if proxy is None:
+    if direct:
+        proxy = None
+    elif proxy is None:
         proxy = W.pick_proxy()
     url = checkout_url or BUY_VIP_URL
-    print(f"[{tag}] START card …{cc['number'][-4:]} via {proxy['server']}", flush=True)
+    via = f"direct-IP" if proxy is None else proxy['server']
+    print(f"[{tag}] START card …{cc['number'][-4:]} via {via}", flush=True)
 
     ua = random.choice(W.USER_AGENTS)
     vw, vh = random.choice(W.VIEWPORTS)
@@ -457,6 +578,7 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
 
         print(f"[{tag}] goto {url}", flush=True)
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(1500)  # let the page hydrate before interacting
 
         # Check if form is already visible (direct checkout URLs like /checkout/...)
         form_visible = page.evaluate("""() => {
@@ -485,16 +607,23 @@ def run_final(proxy=None, headless=True, submit=True, tag=None, cc_override=None
                     return {"cc": cc["number"], "last4": last4, "status": "error",
                             "response": "Could not click entry button or find form",
                             "screenshot": f"{tag}_{last4}.png"}
+        # After the entry click the checkout mounts progressively (email first,
+        # then billing, then BasisTheory card frames ~2-4s later). Filling
+        # before it settles makes React blank the form, so settle briefly, then
+        # let fill_and_submit's STEP 0 wait for the FULL billing set.
+        page.wait_for_timeout(2000)
 
-        # Poll until billing fields exist (event-driven, not fixed wait)
-        for _ in range(30):
+        # Poll until form fields exist (event-driven, not fixed wait)
+        for _ in range(60):  # up to 12s
             ready = page.evaluate("""() => {
-                return !!document.querySelector('input[name="name"]')
-                    && !!document.querySelector('input[name="line1"]');
+                return !!(document.querySelector('input[name="email"]')
+                    || document.querySelector('input[name="name"]')
+                    || document.querySelector('input[name="line1"]')
+                    || document.querySelector('input[autocomplete="name"]'));
             }""")
             if ready:
                 break
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(200)
 
         print(f"[{tag}] form ready, filling...", flush=True)
         result = fill_and_submit(page, addr, email, cc, tag=tag, submit=submit)
