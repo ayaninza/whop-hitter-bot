@@ -119,7 +119,7 @@ def _restore_db_file():
             print("[db] no db-backup branch fetchable yet", flush=True)
             return
         s = subprocess.run(["git", "-C", _BASE, "show",
-                            "refs/remotes/origin/db-backup:data/db.json"],
+                            "FETCH_HEAD:data/db.json"],
                            capture_output=True, text=True, timeout=60)
         if s.returncode == 0 and s.stdout:
             os.makedirs(DATA_DIR, exist_ok=True)
