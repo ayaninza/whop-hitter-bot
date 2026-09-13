@@ -35,7 +35,7 @@ import final_bot as F
 
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
-TOKEN = os.environ.get("BOT_TOKEN", "88722621051:AAGNMojy2gWmWTV1Ilhw1-cBGV4Kic38Nww")
+TOKEN = os.environ.get("BOT_TOKEN", "8722621051:AAFg8JGirGlkqwo9gY79YF7vLIrNLi4Y7cs")
 bot = telebot.TeleBot(TOKEN, threaded=True)
 
 DB_FILE = "db.json"
