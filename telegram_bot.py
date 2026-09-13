@@ -14,6 +14,7 @@ crashes and restarts.
 """
 
 import json
+import io
 import os
 import re
 import threading
@@ -34,7 +35,7 @@ import final_bot as F
 
 # token from env (Railway) with a fallback (repo is private, so not leaked).
 # Prefer setting BOT_TOKEN in Railway env and removing this fallback.
-TOKEN = os.environ.get("BOT_TOKEN", "8722621051:AAGNMojy2gWmWTV1Ilhw1-cBGV4Kic38Nww")
+TOKEN = os.environ.get("BOT_TOKEN", "8831100897:AAEIfWzUZEUqgfB-1oi4wB7XRVn0-g9krB0")
 bot = telebot.TeleBot(TOKEN, threaded=True)
 
 DB_FILE = "db.json"
@@ -854,7 +855,7 @@ def cmd_whop(m):
     blines = body.splitlines()
     url_line = next((l.strip() for l in blines if l.strip().startswith("http")), None)
     if not url_line:
-        bot.send_message(m.chat.id, "? /whop `<checkout url>`",
+        bot.send_message(m.chat.id, "\u26a0\ufe0f /whop `<checkout url>`\n\n_usage: /whop <url> [card1] [card2] ...\n_use /ccs to manage saved cards.",
                          parse_mode="Markdown")
         return
     url = url_line
